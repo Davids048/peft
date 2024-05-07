@@ -760,6 +760,30 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model.set_adapter(adapter_name)
         _set_adapter(self, adapter_name)
 
+    def batch_adapters(self, adapter_lst: list, save_directory=None)->None:
+        print("model: batching adapter")
+        # create a config for the new adapter
+        # extract the 0th adapter's config as the batched_adapter's config
+        config = self.peft_config[adapter_lst[0]]
+        self.add_adapter("batched_adapter", config)
+
+        # batch adapters
+        self.base_model.batch_adapters(adapter_lst)
+        print("after batch adapter:\n", self.base_model)
+
+        # QUESTION: update config?
+        # NOTE: currently peft enforces the shape to be consistent. But after 
+        # batching, the layer's adapter shape will be changed. So we can't load
+        # the batched adapter for now. 
+        # self.save_pretrained(save_directory, selected_adapters=["batched_adapter"])
+
+    def unbatch_adapters(self, adapter_lst: list) -> None:
+        """
+        Put the adapters in adapter_lst back to cuda
+        """
+        self.base_model.unbatch_adapters(adapter_lst)
+
+
     @property
     def base_model_torch_dtype(self):
         return getattr(self.base_model, "dtype", None)

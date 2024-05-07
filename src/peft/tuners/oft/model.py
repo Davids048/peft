@@ -22,6 +22,7 @@ from torch import nn
 from peft.tuners.lycoris_utils import LycorisConfig, LycorisTuner
 
 from .layer import Conv2d, Linear, OFTLayer
+import warnings
 
 
 class OFTModel(LycorisTuner):
@@ -105,3 +106,24 @@ class OFTModel(LycorisTuner):
         else:
             new_module = self._create_new_module(config, adapter_name, target, **kwargs)
             self._replace_module(parent, target_name, new_module, target)
+
+
+    def batch_adapters(self, adapter_lst):
+        print("OFT: batch_adapters")
+        for module in self.model.modules():
+            if isinstance(module, OFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                module.batch_adapters(adapter_lst)
+
+    def unbatch_adapters(self, adapter_lst):
+        """
+        Put the adapters in adapter_lst back to cuda
+        """
+        for module in self.model.modules():
+            if isinstance(module, OFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                module.unbatch_adapters(adapter_lst)
