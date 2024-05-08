@@ -30,11 +30,14 @@ class PeftType(str, enum.Enum):
     - PREFIX_TUNING
     - LORA
     - ADALORA
+    - BOFT
     - ADAPTION_PROMPT
     - IA3
     - LOHA
     - LOKR
     - OFT
+    - POLY
+    - LN_TUNING
     """
 
     PROMPT_TUNING = "PROMPT_TUNING"
@@ -50,6 +53,8 @@ class PeftType(str, enum.Enum):
     LOKR = "LOKR"
     OFT = "OFT"
     POLY = "POLY"
+    LN_TUNING = "LN_TUNING"
+    VERA = "VERA"
 
 
 class TaskType(str, enum.Enum):
@@ -59,7 +64,7 @@ class TaskType(str, enum.Enum):
     Overview of the supported task types:
     - SEQ_CLS: Text classification.
     - SEQ_2_SEQ_LM: Sequence-to-sequence language modeling.
-    - Causal LM: Causal language modeling.
+    - CAUSAL_LM: Causal language modeling.
     - TOKEN_CLS: Token classification.
     - QUESTION_ANS: Question answering.
     - FEATURE_EXTRACTION: Feature extraction. Provides the hidden states which can be used as embeddings or features

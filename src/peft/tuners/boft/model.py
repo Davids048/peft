@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,39 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import operator
-import re
+# The implementation is based on "Parameter-Efficient Orthogonal Finetuning
+# via Butterfly Factorization" (https://arxiv.org/abs/2311.06243) in ICLR 2024.
+
 import warnings
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from enum import Enum
-from functools import reduce
-from itertools import chain
 from typing import List, Optional
 
 import torch
 from torch import nn
 from tqdm import tqdm
-from transformers.pytorch_utils import Conv1D
 
-from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, check_target_module_exists
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
-    _freeze_adapter,
     _get_submodules,
-    get_auto_gptq_quant_linear,
-    get_quantization_config,
 )
 
 from .config import BOFTConfig
-from .layer import Linear, Conv2d, BOFTLayer
+from .layer import BOFTLayer, Conv2d, Linear
 
 
 class BOFTModel(BaseTuner):
     """
-    Creates BOFT and OFT model from a pretrained transformers model. Paper:
-    https://arxiv.org/abs/2311.06243
+    Creates BOFT and OFT model from a pretrained transformers model. Paper: https://arxiv.org/abs/2311.06243
     https://arxiv.org/abs/2306.07280
 
     Args:
@@ -58,26 +50,15 @@ class BOFTModel(BaseTuner):
 
     Example::
 
-        ```py
-        >>> import transformers
-        >>> from transformers import AutoModelForSeq2SeqLM, BOFTConfig
-        >>> from peft import BOFTConfig, get_peft_model
+        >>> import transformers >>> from transformers import AutoModelForSeq2SeqLM, BOFTConfig >>> from peft import
+        BOFTConfig, get_peft_model
 
-        >>> config = BOFTConfig(
-        ...     boft_block_size=8,
-        ...     boft_n_butterfly_factor=1,
-        ...     target_modules=["query", "value", "key", "output.dense", "mlp.fc1", "mlp.fc2"],
-        ...     boft_dropout=0.1,
-        ...     bias="boft_only",
-        ...     modules_to_save=["classifier"],
-        ... )
+        >>> config = BOFTConfig( ... boft_block_size=8, ... boft_n_butterfly_factor=1, ... target_modules=["query",
+        "value", "key", "output.dense", "mlp.fc1", "mlp.fc2"], ... boft_dropout=0.1, ... bias="boft_only", ...
+        modules_to_save=["classifier"], ... )
 
-        >>> model = transformers.Dinov2ForImageClassification.from_pretrained(
-        ...     "facebook/dinov2-large",
-        ...     num_labels=100,
-        ... )
-        >>> boft_model = get_peft_model(model, config)
-        ```
+        >>> model = transformers.Dinov2ForImageClassification.from_pretrained( ... "facebook/dinov2-large", ...
+        num_labels=100, ... ) >>> boft_model = get_peft_model(model, config)
 
     **Attributes**:
         - **model** ([`transformers.PreTrainedModel`]) -- The model to be adapted.
@@ -128,25 +109,25 @@ class BOFTModel(BaseTuner):
             "boft_n_butterfly_factor": boft_config.boft_n_butterfly_factor,
             "boft_dropout": boft_config.boft_dropout,
             "fan_in_fan_out": boft_config.fan_in_fan_out,
-            "init_boft_weights": boft_config.init_boft_weights,
+            "init_weights": boft_config.init_weights,
         }
         kwargs["bias"] = bias
 
         # If it is not a BOFTLayer, create a new module, else update it with new adapters
         if not isinstance(target, BOFTLayer):
             new_module = self._create_new_module(boft_config, adapter_name, target, **kwargs)
-            if adapter_name != self.active_adapter:
+            if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
         else:
             target.update_layer(
                 adapter_name,
-                boft_config.boft_block_size,
-                boft_config.boft_block_num,
-                boft_config.boft_n_butterfly_factor,
-                boft_config.boft_dropout,
-                boft_config.init_boft_weights,
+                boft_block_size=boft_config.boft_block_size,
+                boft_block_num=boft_config.boft_block_num,
+                boft_n_butterfly_factor=boft_config.boft_n_butterfly_factor,
+                boft_dropout=boft_config.boft_dropout,
+                init_weights=boft_config.init_weights,
             )
 
     def _replace_module(self, parent, child_name, new_module, child):
@@ -215,7 +196,8 @@ class BOFTModel(BaseTuner):
             new_module = Conv2d(target, adapter_name, **kwargs)
         else:
             raise ValueError(
-                f"Target module {target} is not supported. " f"Currently, only `torch.nn.Linear` and `torch.nn.Conv2d` is supported."
+                f"Target module {target} is not supported. "
+                "Currently, only `torch.nn.Linear` and `torch.nn.Conv2d` are supported."
             )
 
         return new_module
@@ -262,6 +244,7 @@ class BOFTModel(BaseTuner):
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.set_adapter(adapter_name)
+        self.active_adapter = adapter_name
 
     @staticmethod
     def _prepare_adapter_config(peft_config, model_config):

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,17 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest
+import re
 
+import pytest
 import torch
 from scipy import stats
 from torch import nn
 
-from peft import LoraConfig, get_peft_model
+from peft import AdaLoraConfig, LoraConfig, PromptTuningConfig, VeraConfig, get_peft_model
 from peft.utils import infer_device
 
 
-class InitializationTest(unittest.TestCase):
+class TestLoraInitialization:
     """Test class to check the initialization of adapters."""
 
     torch_device = infer_device()
@@ -48,9 +48,15 @@ class InitializationTest(unittest.TestCase):
                 self.conv2d = nn.Conv2d(100, 100, 3)
 
             def forward(self, x):
-                return self.linear(x)
+                x_int = (100 * x).int()
+                x_4d = x.flatten().reshape(1, 100, 10, 10)
+                return self.linear(x), self.embed(x_int), self.conv2d(x_4d)
 
         return MyModule().eval().to(self.torch_device)
+
+    @pytest.fixture
+    def data(self):
+        return torch.rand(10, 1000).to(self.torch_device)
 
     def test_lora_linear_init_default(self):
         # default is True
@@ -65,15 +71,15 @@ class InitializationTest(unittest.TestCase):
         # use statistical test to check if weight A is from a uniform distribution
         unif = self.get_uniform(weight_A.min().item(), weight_A.max().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight A is *not* from a normal distribution
         normal = self.get_normal(weight_A.mean().item(), weight_A.std().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), normal.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight B is zero
-        self.assertTrue((weight_B == 0.0).all())
+        assert (weight_B == 0.0).all()
 
     def test_lora_linear_init_gaussian(self):
         # use gaussian init
@@ -93,15 +99,15 @@ class InitializationTest(unittest.TestCase):
         # x = weight_A.detach().flatten().cpu().numpy()
         # breakpoint()
 
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight A is *not* from a uniform distribution
         unif = self.get_uniform(weight_A.min().item(), weight_A.max().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight B is zero
-        self.assertTrue((weight_B == 0.0).all())
+        assert (weight_B == 0.0).all()
 
     def test_lora_linear_false(self):
         torch.manual_seed(0)
@@ -113,7 +119,7 @@ class InitializationTest(unittest.TestCase):
 
         # with init_lora_weights=False, weight B should *not* be zero. We don't care so much about the actual values
         # as long as they are not zero, in order to avoid identity transformation.
-        self.assertFalse(torch.allclose(weight_B, torch.zeros_like(weight_B)))
+        assert not torch.allclose(weight_B, torch.zeros_like(weight_B))
 
     def test_lora_embedding_default(self):
         # embedding is initialized as a normal distribution, not kaiming uniform
@@ -128,15 +134,15 @@ class InitializationTest(unittest.TestCase):
         # use statistical test to check if weight B is from a normal distribution
         normal = self.get_normal(0.0, 1.0)
         _, p_value = stats.kstest(weight_B.detach().flatten().cpu().numpy(), normal.flatten().cpu().numpy())
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight B is *not* from a uniform distribution
         unif = self.get_uniform(weight_B.min().item(), weight_B.max().item())
         _, p_value = stats.kstest(weight_B.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight A is zero
-        self.assertTrue((weight_A == 0.0).all())
+        assert (weight_A == 0.0).all()
 
     def test_lora_embedding_gaussian(self):
         # embedding does not change with init_lora_weights="gaussian" vs True
@@ -151,15 +157,15 @@ class InitializationTest(unittest.TestCase):
         # use statistical test to check if weight B is from a normal distribution
         normal = self.get_normal(0.0, 1.0)
         _, p_value = stats.kstest(weight_B.detach().flatten().cpu().numpy(), normal.flatten().cpu().numpy())
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight B is *not* from a uniform distribution
         unif = self.get_uniform(weight_B.min().item(), weight_B.max().item())
         _, p_value = stats.kstest(weight_B.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight A is zero
-        self.assertTrue((weight_A == 0.0).all())
+        assert (weight_A == 0.0).all()
 
     def test_lora_embedding_false(self):
         torch.manual_seed(0)
@@ -171,7 +177,7 @@ class InitializationTest(unittest.TestCase):
 
         # with init_lora_weights=False, weight A should *not* be zero. We don't care so much about the actual values
         # as long as they are not zero, in order to avoid identity transformation.
-        self.assertFalse(torch.allclose(weight_A, torch.zeros_like(weight_A)))
+        assert not torch.allclose(weight_A, torch.zeros_like(weight_A))
 
     def test_lora_conv2d_default(self):
         # default is True
@@ -186,15 +192,15 @@ class InitializationTest(unittest.TestCase):
         # use statistical test to check if weight A is from a uniform distribution
         unif = self.get_uniform(weight_A.min().item(), weight_A.max().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight A is *not* from a normal distribution
         normal = self.get_normal(weight_A.mean().item(), weight_A.std().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), normal.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight B is zero
-        self.assertTrue((weight_B == 0.0).all())
+        assert (weight_B == 0.0).all()
 
     def test_lora_conv2d_init_gaussian(self):
         # use gaussian init
@@ -209,15 +215,15 @@ class InitializationTest(unittest.TestCase):
         # use statistical test to check if weight A is from a normal distribution
         normal = self.get_normal(0.0, 1 / config.r)
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), normal.flatten().cpu().numpy())
-        self.assertGreater(p_value, 0.5)
+        assert p_value > 0.5
 
         # check that weight A is *not* from a uniform distribution
         unif = self.get_uniform(weight_A.min().item(), weight_A.max().item())
         _, p_value = stats.kstest(weight_A.detach().flatten().cpu().numpy(), unif.flatten().cpu().numpy())
-        self.assertLess(p_value, 0.05)
+        assert p_value < 0.05
 
         # check that weight B is zero
-        self.assertTrue((weight_B == 0.0).all())
+        assert (weight_B == 0.0).all()
 
     def test_lora_conv2d_false(self):
         torch.manual_seed(0)
@@ -229,7 +235,7 @@ class InitializationTest(unittest.TestCase):
 
         # with init_lora_weights=False, weight B should *not* be zero. We don't care so much about the actual values
         # as long as they are not zero, in order to avoid identity transformation.
-        self.assertFalse(torch.allclose(weight_B, torch.zeros_like(weight_B)))
+        assert not torch.allclose(weight_B, torch.zeros_like(weight_B))
 
     def test_lora_scaling_default(self):
         # default is True
@@ -243,11 +249,11 @@ class InitializationTest(unittest.TestCase):
 
         expected_scaling = config.lora_alpha / config.r
 
-        self.assertTrue(model.linear.scaling["default"] == expected_scaling)
-        self.assertTrue(model.embed.scaling["default"] == expected_scaling)
-        self.assertTrue(model.conv2d.scaling["default"] == expected_scaling)
+        assert model.linear.scaling["default"] == expected_scaling
+        assert model.embed.scaling["default"] == expected_scaling
+        assert model.conv2d.scaling["default"] == expected_scaling
 
-    def test_rslora_scaling(self):
+    def test_lora_rslora_scaling(self):
         # default is True
         torch.manual_seed(0)
 
@@ -259,9 +265,9 @@ class InitializationTest(unittest.TestCase):
 
         expected_scaling = config.lora_alpha / (config.r**0.5)
 
-        self.assertTrue(model.linear.scaling["default"] == expected_scaling)
-        self.assertTrue(model.embed.scaling["default"] == expected_scaling)
-        self.assertTrue(model.conv2d.scaling["default"] == expected_scaling)
+        assert model.linear.scaling["default"] == expected_scaling
+        assert model.embed.scaling["default"] == expected_scaling
+        assert model.conv2d.scaling["default"] == expected_scaling
 
     def test_lora_default_scaling_pattern(self):
         # default is True
@@ -286,11 +292,11 @@ class InitializationTest(unittest.TestCase):
             "conv2d": config.alpha_pattern["conv2d"] / config.rank_pattern["conv2d"],
         }
 
-        self.assertTrue(model.linear.scaling["default"] == expected_scaling["linear"])
-        self.assertTrue(model.embed.scaling["default"] == expected_scaling["embed"])
-        self.assertTrue(model.conv2d.scaling["default"] == expected_scaling["conv2d"])
+        assert model.linear.scaling["default"] == expected_scaling["linear"]
+        assert model.embed.scaling["default"] == expected_scaling["embed"]
+        assert model.conv2d.scaling["default"] == expected_scaling["conv2d"]
 
-    def test_rslora_scaling_pattern(self):
+    def test_lora_rslora_scaling_pattern(self):
         # default is True
         torch.manual_seed(0)
 
@@ -313,6 +319,100 @@ class InitializationTest(unittest.TestCase):
             "conv2d": config.alpha_pattern["conv2d"] / (config.rank_pattern["conv2d"] ** 0.5),
         }
 
-        self.assertTrue(model.linear.scaling["default"] == expected_scaling["linear"])
-        self.assertTrue(model.embed.scaling["default"] == expected_scaling["embed"])
-        self.assertTrue(model.conv2d.scaling["default"] == expected_scaling["conv2d"])
+        assert model.linear.scaling["default"] == expected_scaling["linear"]
+        assert model.embed.scaling["default"] == expected_scaling["embed"]
+        assert model.conv2d.scaling["default"] == expected_scaling["conv2d"]
+
+    def test_lora_use_dora_linear(self, data):
+        # check that dora is a no-op when initialized
+        torch.manual_seed(0)
+        model = self.get_model()
+        output_base, _, _ = model(data)
+
+        # check scaling factor use_rslora=True
+        config = LoraConfig(target_modules=["linear"], use_dora=True)
+        model = get_peft_model(model, config)
+
+        with model.disable_adapter():
+            output_disabled, _, _ = model(data)
+        output_dora, _, _ = model(data)
+
+        assert torch.allclose(output_base, output_disabled)
+        assert torch.allclose(output_base, output_dora)
+
+    def test_lora_use_dora_linear_init_false(self, data):
+        # with init_lora_weights=False, dora should not be a no-op
+        torch.manual_seed(0)
+        model = self.get_model()
+        output_base, _, _ = model(data)
+
+        # check scaling factor use_rslora=True
+        config = LoraConfig(target_modules=["linear"], use_dora=True, init_lora_weights=False)
+        model = get_peft_model(model, config)
+
+        with model.disable_adapter():
+            output_disabled, _, _ = model(data)
+        output_dora, _, _ = model(data)
+
+        assert torch.allclose(output_base, output_disabled)
+        assert not torch.allclose(output_base, output_dora)
+
+    def test_lora_use_dora_with_megatron_core_raises(self):
+        megatron_config = {"does-not": "matter-here"}
+        with pytest.raises(ValueError, match="DoRA does not support megatron_core"):
+            LoraConfig(target_modules=["linear"], use_dora=True, megatron_config=megatron_config)
+
+
+class TestAdaLoraInitialization:
+    def test_adalora_target_modules_set(self):
+        config = AdaLoraConfig(target_modules=["linear", "embed", "conv2d"])
+        assert config.target_modules == {"linear", "embed", "conv2d"}
+
+    def test_adalora_use_dora_raises(self):
+        with pytest.raises(ValueError, match="ADALORA does not support DoRA"):
+            AdaLoraConfig(use_dora=True)
+
+    def test_adalora_loftq_config_raises(self):
+        with pytest.raises(ValueError, match="ADALORA does not support LOFTQ"):
+            AdaLoraConfig(loftq_config={"loftq": "config"})
+
+
+class TestPromptTuningInitialization:
+    torch_device = infer_device()
+
+    def get_model(self):
+        class MyModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # choose a large weight so that averages are close to expected values
+                self.linear = nn.Linear(1000, 1000)
+                self.embed = nn.Embedding(1000, 1000)
+                self.conv2d = nn.Conv2d(100, 100, 3)
+
+            def forward(self, x):
+                x_int = (100 * x).int()
+                x_4d = x.flatten().reshape(1, 100, 10, 10)
+                return self.linear(x), self.embed(x_int), self.conv2d(x_4d)
+
+        return MyModule().eval().to(self.torch_device)
+
+    def test_use_prompt_tuning_init_text_raises(self):
+        with pytest.raises(ValueError, match="When prompt_tuning_init='TEXT', tokenizer_name_or_path can't be None"):
+            PromptTuningConfig(prompt_tuning_init="TEXT", prompt_tuning_init_text="prompt tuning init text")
+        with pytest.raises(ValueError, match="When prompt_tuning_init='TEXT', prompt_tuning_init_text can't be None"):
+            PromptTuningConfig(prompt_tuning_init="TEXT", tokenizer_name_or_path="t5-base")
+
+    def test_vera_mixing_save_projection_raises(self):
+        # it is unclear what the right thing to do would be if some adapters save the projection weights and some don't
+        # so we better raise an error
+
+        config0 = VeraConfig(target_modules="linear", init_weights=False, save_projection=True)
+        model = self.get_model()
+        model = get_peft_model(model, config0)
+        config1 = VeraConfig(target_modules="linear", init_weights=False, save_projection=False)
+        msg = re.escape(
+            "VeRA projection weights must be saved for all adapters or none, but got multiple different values: "
+            "[False, True]"
+        )
+        with pytest.raises(ValueError, match=msg):
+            model.add_adapter("other", config1)

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,68 +12,101 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The implementation is based on "Parameter-Efficient Orthogonal Finetuning
+# via Butterfly Factorization" (https://arxiv.org/abs/2311.06243) in ICLR 2024.
+
+from __future__ import annotations
+
 import math
+import os
 import warnings
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.cpp_extension import load, CUDA_HOME
 from torch.autograd import Function
+from torch.utils.cpp_extension import load
 
-from peft.tuners.tuners_utils import BaseTunerLayer
-from peft.utils.other import transpose
+from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
-import os
 
 os.environ["CC"] = "gcc"
 os.environ["CXX"] = "gcc"
 curr_dir = os.path.dirname(__file__)
+
+_FBD_CUDA = None
+
+
+def get_fbd_cuda():
+    global _FBD_CUDA
+
+    if _FBD_CUDA is not None:
+        return _FBD_CUDA
+
+    curr_dir = os.path.dirname(__file__)
+    # need ninja to build the extension
+    try:
+        fbd_cuda = load(
+            name="fbd_cuda",
+            sources=[f"{curr_dir}/fbd/fbd_cuda.cpp", f"{curr_dir}/fbd/fbd_cuda_kernel.cu"],
+            verbose=True,
+            # build_directory='/tmp/'  # for debugging
+        )
+        # extra_cuda_cflags = ['-std=c++14', '-ccbin=$$(which gcc-7)']) # cuda10.2 is not compatible with gcc9. Specify gcc 7
+        import fbd_cuda
+    except Exception as e:
+        warnings.warn(f"Failed to load the CUDA extension: {e}, check if ninja is available.")
+        warnings.warn("Setting boft_n_butterfly_factor to 1 to speed up the finetuning process.")
+        fbd_cuda = None
+
+    _FBD_CUDA = fbd_cuda
+    return _FBD_CUDA
 
 
 class FastBlockDiag(Function):
     """
     Implements a custom autograd Function for a fast block diagonal operation using CUDA.
 
-    This function is optimized for 4D tensors where the last two dimensions are equal,
-    representing block diagonal matrices for efficient computation on CUDA devices.
-    """        
+    This function is optimized for 4D tensors where the last two dimensions are equal, representing block diagonal
+    matrices for efficient computation on CUDA devices.
+    """
+
     @staticmethod
     def forward(ctx, input):
         """
         The forward method for FastBlockDiag.
 
-        Computes the block diagonal operation on the input tensor using a CUDA-optimized function.
-        This method assumes that the input is a 4D tensor where the last two dimensions are equal,
-        which represent the blocks to be diagonalized.
+        Computes the block diagonal operation on the input tensor using a CUDA-optimized function. This method assumes
+        that the input is a 4D tensor where the last two dimensions are equal, which represent the blocks to be
+        diagonalized.
 
         Parameters:
         ctx: A context object that can be used to stash information for backward computation.
         input (Tensor): The input tensor of shape (N, D, H, H), where `N` is the batch size,
-                        `D` represents one additional dimension (In BOFT, the number of BOFT blocks),
-                        and `H` is the size of the square blocks along the last two dimensions
-                        (In BOFT, the block size).
+                        `D` represents one additional dimension (In BOFT, the number of BOFT blocks), and `H` is the
+                        size of the square blocks along the last two dimensions (In BOFT, the block size).
 
         Returns:
         Tensor: The resulting tensor after applying the block diagonal operation,
                 will have the shape (N, DxH, DxH).
         """
-        output = fbd_cuda.forward(input)[0]
+        output = get_fbd_cuda().forward(input)[0]
         ctx.save_for_backward(input)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         (input,) = ctx.saved_tensors
-        grad_input = fbd_cuda.backward(grad_output, input)[0]
+        grad_input = get_fbd_cuda().backward(grad_output, input)[0]
         return grad_input
 
 
 class MultiplicativeDropoutLayer(nn.Module):
     """
     Implements the multiplicative dropout layer for BOFT.
-    """            
+    """
+
     def __init__(self, p=0.0):
         """
         Initializes the multiplicative dropout layer.
@@ -82,18 +114,17 @@ class MultiplicativeDropoutLayer(nn.Module):
         Parameters:
         p (float): The probability of dropping out a block. Defaults to 0.0.
         """
-        super(MultiplicativeDropoutLayer, self).__init__()
+        super().__init__()
         self.p = p
 
     def forward(self, x):
         """
-        The forward method for MultiplicativeDropoutLayer.
-
         Applies multiplicative dropout to the input tensor.
+
         Parameters:
         x (Tensor): The input tensor of shape (N, D, H, H), where `N` is the batch size, `D` represents
-                    one additional dimension (In BOFT, the number of BOFT blocks), and `H` is the size
-                    of the square blocks along the last two dimensions (In BOFT, the block size).
+                    one additional dimension (In BOFT, the number of BOFT blocks), and `H` is the size of the square
+                    blocks along the last two dimensions (In BOFT, the block size).
         """
         if self.training:
             # Ensure the last two dimensions are the same
@@ -128,6 +159,7 @@ class BOFTLayer(BaseTunerLayer):
     """
     Implements the BOFT layer.
     """
+
     # All names of layers that may contain (trainable) adapter weights
     adapter_layer_names = ("boft_R", "boft_s")
     # All names of other parameters that may contain adapter-related parameters
@@ -137,7 +169,8 @@ class BOFTLayer(BaseTunerLayer):
         """
         Initializes the BOFT layer.
 
-        Note, currently only support linear layer and convolutional layer, with further support for other layers to be added soon.
+        Note, currently only support linear layer and convolutional layer, with further support for other layers to be
+        added soon.
 
         Parameters:
         base_layer: the pretrained model layer
@@ -164,28 +197,42 @@ class BOFTLayer(BaseTunerLayer):
 
         self.in_features = in_features
         self.out_features = out_features
-        
-        global fbd_cuda
-        fbd_cuda = load(
-            name="fbd_cuda",
-            sources=[f"{curr_dir}/fbd/fbd_cuda.cpp", f"{curr_dir}/fbd/fbd_cuda_kernel.cu"],
-            verbose=True,
-            # build_directory='/tmp/'  # for debugging
-            )
-        # extra_cuda_cflags = ['-std=c++14', '-ccbin=$$(which gcc-7)']) # cuda10.2 is not compatible with gcc9. Specify gcc 7
-        import fbd_cuda
+
+    def set_scale(self, adapter, scale):
+        if adapter not in self.scaling:
+            # Ignore the case where the adapter is not in the layer
+            return
+
+        warnings.warn("Scaling operation for BOFT not supported! Automatically set scale to 1.")
+
+    def scale_layer(self, scale: float) -> None:
+        if scale == 1:
+            return
+
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.boft_R.keys():
+                continue
+
+            warnings.warn("Scaling operation for BOFT not supported! Automatically set scale to 1.")
+
+    def unscale_layer(self, scale=None) -> None:
+        for active_adapter in self.active_adapters:
+            if active_adapter not in self.boft_R.keys():
+                continue
+
+            warnings.warn("Unscaling operation for BOFT not supported! Keeping scale to 1.")
 
     def update_layer(
-        self, adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_boft_weights
+        self, adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_weights
     ):
         """
         Update the linear layer with trainable BOFT weights. Override for other layer types.
         """
-        # to be consistent with the paper notation 
+        # to be consistent with the paper notation
         boft_n_butterfly_factor = boft_n_butterfly_factor - 1
         if boft_n_butterfly_factor < 0:
             raise ValueError(
-                f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor} to be a positive integer number."
+                f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor+1} to be a positive integer number."
             )
 
         # Initialize the MultiplicativeDropoutLayer for boft_dropout > 0.0.
@@ -194,12 +241,6 @@ class BOFTLayer(BaseTunerLayer):
         else:
             boft_dropout_layer = nn.Identity()
         self.boft_dropout.update(nn.ModuleDict({adapter_name: boft_dropout_layer}))
-
-        # Initialize the BOFT parameters.
-        if not (boft_block_size != 0) ^ (boft_block_num != 0):
-            raise ValueError(
-                f"You can only specify either boft_block_size ({boft_block_size}) or boft_block_num ({boft_block_num}), but not both simultaneously, because boft_block_size x boft_block_num != in_features."
-            )
 
         if boft_block_size == 0 and boft_block_num != 0:
             if self.in_features % boft_block_num != 0:
@@ -210,11 +251,11 @@ class BOFTLayer(BaseTunerLayer):
             if boft_n_butterfly_factor != 0:
                 if boft_n_butterfly_factor > int(math.log2(boft_block_num)):
                     raise ValueError(
-                        f"Invalid combination of boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_num ({boft_block_num})!"
+                        f"Invalid combination of boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_num ({boft_block_num})!"
                     )
                 if boft_block_num % (2**boft_n_butterfly_factor) != 0:
                     raise ValueError(
-                        f"boft_block_num ({boft_block_num}) must be a multiple of 2 raised to the power of boft_n_butterfly_factor ({boft_n_butterfly_factor})!"
+                        f"boft_block_num ({boft_block_num}) must be a multiple of 2 raised to the power of boft_n_butterfly_factor ({boft_n_butterfly_factor+1})!"
                     )
 
             boft_block_size = int(self.in_features // boft_block_num)
@@ -228,17 +269,20 @@ class BOFTLayer(BaseTunerLayer):
             if boft_n_butterfly_factor != 0:
                 if self.in_features < (boft_block_size * (2**boft_n_butterfly_factor)):
                     raise ValueError(
-                        f"Invalid combination of in_features ({self.in_features}), boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_size ({boft_block_size})!"
+                        f"Invalid combination of in_features ({self.in_features}), boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_size ({boft_block_size})!"
                     )
                 if self.in_features % (boft_block_size * (2**boft_n_butterfly_factor)) != 0:
                     raise ValueError(
-                        f"Invalid combination of in_features ({self.in_features}), boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_size ({boft_block_size})!"
+                        f"Invalid combination of in_features ({self.in_features}), boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_size ({boft_block_size})!"
                     )
 
             boft_block_num = int(self.in_features // boft_block_size)
 
         else:
-            raise ValueError("Unknown error!")
+            raise ValueError(
+                f"You can only specify either boft_block_size ({boft_block_size}) or boft_block_num ({boft_block_num}), but not both simultaneously or setting both"
+                "to be 0, because boft_block_size x boft_block_num != in_features."
+            )
 
         # In OFT you can specify the number of blocks to be 1
         if boft_n_butterfly_factor != 0:
@@ -250,7 +294,7 @@ class BOFTLayer(BaseTunerLayer):
 
         # If there is no butterfly factor, then permutation matrix P will be an identity matrix.
         P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
-        for i in range((boft_n_butterfly_factor + 1)):
+        for i in range(boft_n_butterfly_factor + 1):
             perm = self.block_butterfly_perm(
                 self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
             )
@@ -264,7 +308,7 @@ class BOFTLayer(BaseTunerLayer):
         )
         self.boft_s[adapter_name] = nn.Parameter(torch.ones(int(self.out_features), 1))
 
-        self.reset_boft_parameters(adapter_name, init_boft_weights)
+        self.reset_boft_parameters(adapter_name, init_weights)
 
         weight = getattr(self, "weight", None)
         if weight is not None:
@@ -273,28 +317,29 @@ class BOFTLayer(BaseTunerLayer):
                 self.to(weight.device, dtype=weight.dtype)
             else:
                 self.to(weight.device)
-        self.set_adapter(self.active_adapters)
 
         # set the boft block size and number
         self.boft_block_size[adapter_name] = boft_block_size
         self.boft_block_num[adapter_name] = boft_block_num
 
-    def reset_boft_parameters(self, adapter_name, init_boft_weights):
+        self.set_adapter(self.active_adapters)
+
+    def reset_boft_parameters(self, adapter_name, init_weights):
         """
         Reset the BOFT parameters.
         """
-        if init_boft_weights is False:
+        if init_weights is False:
             nn.init.normal_(self.boft_R[adapter_name], mean=0.0, std=0.1)
             nn.init.normal_(self.boft_s[adapter_name], mean=1.0, std=0.1)
             return
 
         if adapter_name in self.boft_R.keys():
-            if init_boft_weights is True:
+            if init_weights is True:
                 # initialize R to zero
                 nn.init.zeros_(self.boft_R[adapter_name])
                 nn.init.ones_(self.boft_s[adapter_name])
             else:
-                raise ValueError(f"Unknown initialization {init_boft_weights=}") 
+                raise ValueError(f"Unknown initialization {init_weights=}")
 
     def perm2mat(self, indices):
         """
@@ -354,6 +399,23 @@ class BOFTLayer(BaseTunerLayer):
             indices[i:block_end] = tmp_indices[sorted_order]
         return indices
 
+    def cayley_batch(self, data):
+        """
+        Perform the Cayley parametrization on a batch of skew-symmetric matrices.
+
+        Args:
+            data: A batch of skew-symmetric matrices of shape (b, r, c).
+        """
+        b, r, c = data.shape
+        # Ensure the input matrix is skew-symmetric
+        skew_mat = 0.5 * (data - data.transpose(1, 2))
+        id_mat = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
+
+        # Perform the Cayley parametrization
+        Q = torch.linalg.solve(id_mat + skew_mat, id_mat - skew_mat, left=False)
+
+        return Q
+
 
 class Linear(nn.Module, BOFTLayer):
     """
@@ -369,7 +431,7 @@ class Linear(nn.Module, BOFTLayer):
         boft_n_butterfly_factor: int = 0,
         boft_dropout: float = 0.1,
         fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        init_boft_weights: Union[bool, str] = True,
+        init_weights: Union[bool, str] = True,
         is_target_conv_1d_layer: bool = False,
         **kwargs,
     ) -> None:
@@ -379,12 +441,20 @@ class Linear(nn.Module, BOFTLayer):
 
         self._active_adapter = adapter_name
 
+        # Attempt to load the CUDA extension during model initialization
+        if not get_fbd_cuda():
+            self.fbd_cuda_available = False
+            # If the CUDA extension is not available, set the butterfly factor to 1 to speed up the finetuning process
+            boft_n_butterfly_factor = 1
+        else:
+            self.fbd_cuda_available = True
+
         self.update_layer(
-            adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_boft_weights
+            adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_weights
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -397,16 +467,12 @@ class Linear(nn.Module, BOFTLayer):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
-        if self.merged:
-            warnings.warn(
-                f"Already following adapters were merged {','.join(self.merged_adapters)}. "
-                f"You are now additionally merging {','.join(self.active_adapters)}."
-            )
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
 
-        if adapter_names is None:
-            adapter_names = self.active_adapters
-
-        for active_adapter in self.active_adapters:
+        for active_adapter in adapter_names:
             if active_adapter in self.boft_R.keys():
                 base_layer = self.get_base_layer()
                 if safe_merge:
@@ -431,7 +497,9 @@ class Linear(nn.Module, BOFTLayer):
                     orig_weight = torch.transpose(orig_weight, 0, 1)
                     orig_weight = torch.mm(butterfly_oft_mat, orig_weight)
                     orig_weight = torch.transpose(orig_weight, 0, 1)
-                    self.base_layer.weight.data = orig_weight * boft_s
+                    orig_weight = orig_weight * boft_s
+
+                    self.base_layer.weight.data = orig_weight
 
                 self.merged_adapters.append(active_adapter)
 
@@ -454,7 +522,7 @@ class Linear(nn.Module, BOFTLayer):
 
                 self.get_base_layer().weight.data = orig_weight * (1 / boft_s)
 
-    def get_delta_weight(self, adapter) -> torch.Tensor:
+    def get_delta_weight(self, adapter) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the delta weight for the given adapter.
 
@@ -462,9 +530,6 @@ class Linear(nn.Module, BOFTLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
-        # device = self.boft_R[adapter].device
-        # dtype = self.boft_R[adapter].dtype
-
         boft_R = self.boft_R[adapter]
         boft_s = self.boft_s[adapter]
 
@@ -472,7 +537,12 @@ class Linear(nn.Module, BOFTLayer):
         boft_R = boft_R.view(N * D, H, H)
         orth_rotate_butterfly = self.cayley_batch(boft_R)
         orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-        block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+        if self.fbd_cuda_available:
+            block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+        else:
+            orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+            block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+            block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
 
         butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
         butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
@@ -482,54 +552,6 @@ class Linear(nn.Module, BOFTLayer):
             butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
 
         return butterfly_oft_mat, boft_s
-
-    def cayley_batch(self, data):
-        """
-        Perform the Cayley parametrization on a batch of skew-symmetric matrices.
-        Args:
-            data: A batch of skew-symmetric matrices of shape (b, r, c).
-        """
-        b, r, c = data.shape
-        # Ensure the input matrix is skew-symmetric
-        skew = 0.5 * (data - data.transpose(1, 2))
-        I = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
-
-        # Perform the Cayley parametrization
-        Q = torch.bmm(I - skew, torch.inverse(I + skew))
-        # Q = torch.linalg.solve(I + skew, I - skew, left=False)
-
-        return Q
-
-    def angle2rot(self, alphas):
-        """
-        Convert the angle to rotation matrix.
-        Only applicable for BOFT block size 2.
-        """
-        c = torch.cos(alphas)
-        s = torch.sin(alphas)
-        rot_mats = torch.cat([c, -s, s, c], dim=-1).view(alphas.shape[0], alphas.shape[1], 2, 2)
-        return rot_mats
-
-    def is_orthogonal(self, R, eps=1e-3):
-        """
-        Check if the matrix is orthogonal.
-        """
-        R = R.float()
-        with torch.no_grad():
-            RtR = torch.matmul(R.t(), R)
-            diff = torch.abs(RtR - torch.eye(R.shape[1], dtype=R.dtype, device=R.device))
-            return torch.all(diff < eps)
-
-    def is_identity_matrix(self, tensor):
-        """
-        Check if the matrix is identity.
-        """
-        if not torch.is_tensor(tensor):
-            raise TypeError("Input must be a PyTorch tensor.")
-        if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
-            return False
-        identity = torch.eye(tensor.shape[0], device=tensor.device)
-        return torch.all(torch.eq(tensor, identity))
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
@@ -541,7 +563,9 @@ class Linear(nn.Module, BOFTLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result_initialized = False  # Initialize the flag
+            boft_rotation = torch.eye(self.in_features, device=x.device)
+            boft_scale = torch.ones((int(self.out_features), 1), device=x.device)
+
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.boft_R.keys():
                     continue
@@ -554,7 +578,12 @@ class Linear(nn.Module, BOFTLayer):
                 orth_rotate_butterfly = self.cayley_batch(boft_R)
                 orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
                 orth_rotate_butterfly = dropout(orth_rotate_butterfly)
-                block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                if self.fbd_cuda_available:
+                    block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                else:
+                    orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+                    block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                    block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
 
                 butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                 butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
@@ -563,21 +592,19 @@ class Linear(nn.Module, BOFTLayer):
                 for i in range(1, butterfly_oft_mat_batch.shape[0]):
                     butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
 
-                x = x.to(boft_R.data.dtype)
+                boft_rotation = butterfly_oft_mat @ boft_rotation
+                boft_scale = boft_s * boft_scale
 
-                orig_weight = self.base_layer.weight.data
-                orig_weight = torch.transpose(orig_weight, 0, 1)
-                rotated_weight = torch.mm(butterfly_oft_mat, orig_weight)
-                rotated_weight = torch.transpose(rotated_weight, 0, 1)
+            x = x.to(self.get_base_layer().weight.data.dtype)
 
-                scaled_rotated_weight = rotated_weight * boft_s
+            orig_weight = self.get_base_layer().weight.data
+            orig_weight = torch.transpose(orig_weight, 0, 1)
+            rotated_weight = torch.mm(boft_rotation, orig_weight)
+            rotated_weight = torch.transpose(rotated_weight, 0, 1)
 
-                result = F.linear(input=x, weight=scaled_rotated_weight, bias=self.base_layer.bias)
-                result_initialized = True
+            scaled_rotated_weight = rotated_weight * boft_scale
 
-            # handle the case when there are no activate adapter in BOFT
-            if not result_initialized:
-                result = self.base_layer(x, *args, **kwargs)
+            result = F.linear(input=x, weight=scaled_rotated_weight, bias=self.base_layer.bias)
 
         result = result.to(previous_dtype)
         return result
@@ -587,11 +614,11 @@ class Linear(nn.Module, BOFTLayer):
         return "boft." + rep
 
 
-
 class Conv2d(nn.Module, BOFTLayer):
     """
     BOFT implemented in a Conv2d layer.
     """
+
     def __init__(
         self,
         base_layer: nn.Module,
@@ -600,28 +627,37 @@ class Conv2d(nn.Module, BOFTLayer):
         boft_block_num: int = 0,
         boft_n_butterfly_factor: int = 0,
         boft_dropout: float = 0.1,
-        init_boft_weights: Union[bool, str] = True,
+        init_weights: Union[bool, str] = True,
         **kwargs,
     ) -> None:
         super().__init__()
         BOFTLayer.__init__(self, base_layer)
 
         self._active_adapter = adapter_name
+
+        # Attempt to load the CUDA extension during model initialization
+        if not get_fbd_cuda():
+            self.fbd_cuda_available = False
+            # If the CUDA extension is not available, set the butterfly factor to 1 to speed up the finetuning process
+            boft_n_butterfly_factor = 1
+        else:
+            self.fbd_cuda_available = True
+
         self.update_layer(
-            adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_boft_weights
+            adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_weights
         )
 
     def update_layer(
-        self, adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_boft_weights
+        self, adapter_name, boft_block_size, boft_block_num, boft_n_butterfly_factor, boft_dropout, init_weights
     ):
         """
-        Update the linear layer with trainable BOFT weights.
+        Update the conv2d layer with trainable BOFT weights.
         """
-        # to be consistent with the paper notation 
+        # to be consistent with the paper notation
         boft_n_butterfly_factor = boft_n_butterfly_factor - 1
         if boft_n_butterfly_factor < 0:
             raise ValueError(
-                f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor} to be a positive integer number."
+                f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor+1} to be a positive integer number."
             )
 
         # Initialize the MultiplicativeDropoutLayer for boft_dropout > 0.0.
@@ -650,11 +686,11 @@ class Conv2d(nn.Module, BOFTLayer):
             if boft_n_butterfly_factor != 0:
                 if boft_n_butterfly_factor > int(math.log2(boft_block_num)):
                     raise ValueError(
-                        f"Invalid combination of boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_num ({boft_block_num})!"
+                        f"Invalid combination of boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_num ({boft_block_num})!"
                     )
                 if boft_block_num % (2**boft_n_butterfly_factor) != 0:
                     raise ValueError(
-                        f"boft_block_num ({boft_block_num}) must be a multiple of 2 raised to the power of boft_n_butterfly_factor ({boft_n_butterfly_factor})!"
+                        f"boft_block_num ({boft_block_num}) must be a multiple of 2 raised to the power of boft_n_butterfly_factor ({boft_n_butterfly_factor+1})!"
                     )
 
             boft_block_size = int(conv_filter_dim // boft_block_num)
@@ -668,11 +704,11 @@ class Conv2d(nn.Module, BOFTLayer):
             if boft_n_butterfly_factor != 0:
                 if conv_filter_dim < (boft_block_size * (2**boft_n_butterfly_factor)):
                     raise ValueError(
-                        f"Invalid combination of convolutional kernel dimension ({conv_filter_dim}), boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_size ({boft_block_size})!"
+                        f"Invalid combination of convolutional kernel dimension ({conv_filter_dim}), boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_size ({boft_block_size})!"
                     )
                 if conv_filter_dim % (boft_block_size * (2**boft_n_butterfly_factor)) != 0:
                     raise ValueError(
-                        f"Invalid combination of convolutional kernel dimension ({conv_filter_dim}), boft_n_butterfly_factor ({boft_n_butterfly_factor}) and boft_block_size ({boft_block_size})!"
+                        f"Invalid combination of convolutional kernel dimension ({conv_filter_dim}), boft_n_butterfly_factor ({boft_n_butterfly_factor+1}) and boft_block_size ({boft_block_size})!"
                     )
 
             boft_block_num = int(conv_filter_dim // boft_block_size)
@@ -690,7 +726,7 @@ class Conv2d(nn.Module, BOFTLayer):
 
         # If there is no butterfly factor, then permutation matrix P will be an identity matrix.
         P = torch.empty((boft_n_butterfly_factor + 1, conv_filter_dim, conv_filter_dim))
-        for i in range((boft_n_butterfly_factor + 1)):
+        for i in range(boft_n_butterfly_factor + 1):
             perm = self.block_butterfly_perm(
                 conv_filter_dim, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
             )
@@ -702,9 +738,9 @@ class Conv2d(nn.Module, BOFTLayer):
         self.boft_R[adapter_name] = nn.Parameter(
             torch.zeros(boft_n_butterfly_factor + 1, boft_block_num, boft_block_size, boft_block_size)
         )
-        self.boft_s[adapter_name] = nn.Parameter(torch.ones(int(self.out_features), 1))
+        self.boft_s[adapter_name] = nn.Parameter(torch.ones(1, int(self.out_features)))
 
-        self.reset_boft_parameters(adapter_name, init_boft_weights)
+        self.reset_boft_parameters(adapter_name, init_weights)
 
         weight = getattr(self, "weight", None)
         if weight is not None:
@@ -719,7 +755,7 @@ class Conv2d(nn.Module, BOFTLayer):
         self.boft_block_size[adapter_name] = boft_block_size
         self.boft_block_num[adapter_name] = boft_block_num
 
-    def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
+    def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
         """
         Merge the active adapter weights into the base weights
 
@@ -732,16 +768,12 @@ class Conv2d(nn.Module, BOFTLayer):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
-        if self.merged:
-            warnings.warn(
-                f"Already following adapters were merged {','.join(self.merged_adapters)}. "
-                f"You are now additionally merging {','.join(self.active_adapters)}."
-            )
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
 
-        if adapter_names is None:
-            adapter_names = self.active_adapters
-
-        for active_adapter in self.active_adapters:
+        for active_adapter in adapter_names:
             if active_adapter in self.boft_R.keys():
                 base_layer = self.get_base_layer()
                 if safe_merge:
@@ -749,24 +781,29 @@ class Conv2d(nn.Module, BOFTLayer):
                     # because of the copy operation.
                     orig_weight = base_layer.weight.data.clone()
                     butterfly_oft_mat, boft_s = self.get_delta_weight(active_adapter)
-                    orig_weight = orig_weight.view(self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0], self.out_features)
+
+                    orig_weight = orig_weight.view(
+                        self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0], self.out_features
+                    )
                     orig_weight = torch.mm(butterfly_oft_mat, orig_weight)
                     orig_weight = orig_weight * boft_s
-                    orig_weight = orig_weight.view(self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0])
-
-                    if not torch.isfinite(orig_weight).all():
-                        raise ValueError(
-                            f"NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken"
-                        )
+                    orig_weight = orig_weight.view(
+                        self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0]
+                    )
 
                     self.base_layer.weight.data = orig_weight
                 else:
                     butterfly_oft_mat, boft_s = self.get_delta_weight(active_adapter)
+
                     orig_weight = base_layer.weight.data.clone()
-                    orig_weight = orig_weight.view(self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0], self.out_features)
+                    orig_weight = orig_weight.view(
+                        self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0], self.out_features
+                    )
                     orig_weight = torch.mm(butterfly_oft_mat, orig_weight)
                     orig_weight = orig_weight * boft_s
-                    orig_weight = orig_weight.view(self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0])
+                    orig_weight = orig_weight.view(
+                        self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0]
+                    )
 
                     self.base_layer.weight.data = orig_weight
 
@@ -785,15 +822,22 @@ class Conv2d(nn.Module, BOFTLayer):
                 butterfly_oft_mat, boft_s = self.get_delta_weight(active_adapter)
 
                 orig_weight = self.get_base_layer().weight.data.clone()
-                orig_weight = orig_weight.view(self.in_features * base_layer.kernel_size[0] * base_layer.kernel_size[0], self.out_features)
+                orig_weight = orig_weight.view(
+                    self.in_features * self.get_base_layer().kernel_size[0] * self.get_base_layer().kernel_size[0],
+                    self.out_features,
+                )
                 orig_weight = torch.mm(butterfly_oft_mat.t(), orig_weight)
                 orig_weight = orig_weight * (1 / boft_s)
-                orig_weight = orig_weight.view(self.out_features, self.in_features, base_layer.kernel_size[0], base_layer.kernel_size[0])
+                orig_weight = orig_weight.view(
+                    self.out_features,
+                    self.in_features,
+                    self.get_base_layer().kernel_size[0],
+                    self.get_base_layer().kernel_size[0],
+                )
 
                 self.get_base_layer().weight.data = orig_weight
 
-
-    def get_delta_weight(self, adapter) -> torch.Tensor:
+    def get_delta_weight(self, adapter) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the delta weight for the given adapter.
 
@@ -801,8 +845,6 @@ class Conv2d(nn.Module, BOFTLayer):
             adapter (str):
                 The name of the adapter for which the delta weight should be computed.
         """
-        # device = self.boft_R[adapter].device
-        # dtype = self.boft_R[adapter].dtype
 
         boft_R = self.boft_R[adapter]
         boft_s = self.boft_s[adapter]
@@ -811,7 +853,12 @@ class Conv2d(nn.Module, BOFTLayer):
         boft_R = boft_R.view(N * D, H, H)
         orth_rotate_butterfly = self.cayley_batch(boft_R)
         orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-        block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+        if self.fbd_cuda_available:
+            block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+        else:
+            orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+            block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+            block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
 
         butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
         butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
@@ -821,55 +868,6 @@ class Conv2d(nn.Module, BOFTLayer):
             butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
 
         return butterfly_oft_mat, boft_s
-
-
-    def cayley_batch(self, data):
-        """
-        Perform the Cayley parametrization on a batch of skew-symmetric matrices.
-        Args:
-            data: A batch of skew-symmetric matrices of shape (b, r, c).
-        """
-        b, r, c = data.shape
-        # Ensure the input matrix is skew-symmetric
-        skew = 0.5 * (data - data.transpose(1, 2))
-        I = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
-
-        # Perform the Cayley parametrization
-        Q = torch.bmm(I - skew, torch.inverse(I + skew))
-        # Q = torch.linalg.solve(I + skew, I - skew, left=False)
-
-        return Q
-
-    def angle2rot(self, alphas):
-        """
-        Convert the angle to rotation matrix.
-        Only applicable for BOFT block size 2.
-        """
-        c = torch.cos(alphas)
-        s = torch.sin(alphas)
-        rot_mats = torch.cat([c, -s, s, c], dim=-1).view(alphas.shape[0], alphas.shape[1], 2, 2)
-        return rot_mats
-
-    def is_orthogonal(self, R, eps=1e-3):
-        """
-        Check if the matrix is orthogonal.
-        """
-        R = R.float()
-        with torch.no_grad():
-            RtR = torch.matmul(R.t(), R)
-            diff = torch.abs(RtR - torch.eye(R.shape[1], dtype=R.dtype, device=R.device))
-            return torch.all(diff < eps)
-
-    def is_identity_matrix(self, tensor):
-        """
-        Check if the matrix is identity.
-        """
-        if not torch.is_tensor(tensor):
-            raise TypeError("Input must be a PyTorch tensor.")
-        if tensor.ndim != 2 or tensor.shape[0] != tensor.shape[1]:
-            return False
-        identity = torch.eye(tensor.shape[0], device=tensor.device)
-        return torch.all(torch.eq(tensor, identity))
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         previous_dtype = x.dtype
@@ -881,7 +879,11 @@ class Conv2d(nn.Module, BOFTLayer):
         elif self.merged:
             result = self.base_layer(x, *args, **kwargs)
         else:
-            result_initialized = False  # Initialize the flag
+            boft_rotation = torch.eye(
+                self.in_features * self.base_layer.kernel_size[0] * self.base_layer.kernel_size[0], device=x.device
+            )
+            boft_scale = torch.ones((1, int(self.out_features)), device=x.device)
+
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.boft_R.keys():
                     continue
@@ -894,7 +896,12 @@ class Conv2d(nn.Module, BOFTLayer):
                 orth_rotate_butterfly = self.cayley_batch(boft_R)
                 orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
                 orth_rotate_butterfly = dropout(orth_rotate_butterfly)
-                block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                if self.fbd_cuda_available:
+                    block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                else:
+                    orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+                    block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                    block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
 
                 butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                 butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
@@ -903,21 +910,30 @@ class Conv2d(nn.Module, BOFTLayer):
                 for i in range(1, butterfly_oft_mat_batch.shape[0]):
                     butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
 
-                x = x.to(boft_R.data.dtype)
+                boft_rotation = butterfly_oft_mat @ boft_rotation
+                boft_scale = boft_s * boft_scale
 
-                orig_weight = self.base_layer.weight.data
-                orig_weight = orig_weight.view(self.in_features * self.base_layer.kernel_size[0] * self.base_layer.kernel_size[0], self.out_features)
-                rotated_weight = torch.mm(butterfly_oft_mat, orig_weight)
+            x = x.to(self.base_layer.weight.data.dtype)
 
-                scaled_rotated_weight = rotated_weight * boft_s
+            orig_weight = self.base_layer.weight.data
+            orig_weight = orig_weight.view(
+                self.in_features * self.base_layer.kernel_size[0] * self.base_layer.kernel_size[0],
+                self.out_features,
+            )
+            rotated_weight = torch.mm(boft_rotation, orig_weight)
 
-                scaled_rotated_weight = scaled_rotated_weight.view(self.out_features, self.in_features, self.base_layer.kernel_size[0], self.base_layer.kernel_size[0])
-                result = F.conv2d(input=x, weight=scaled_rotated_weight, bias=self.base_layer.bias, padding=self.base_layer.padding[0], stride=self.base_layer.stride[0])
-                result_initialized = True
+            scaled_rotated_weight = rotated_weight * boft_scale
 
-            # handle the case when there are no activate adapter in BOFT
-            if not result_initialized:
-                result = self.base_layer(x, *args, **kwargs)
+            scaled_rotated_weight = scaled_rotated_weight.view(
+                self.out_features, self.in_features, self.base_layer.kernel_size[0], self.base_layer.kernel_size[0]
+            )
+            result = F.conv2d(
+                input=x,
+                weight=scaled_rotated_weight,
+                bias=self.base_layer.bias,
+                padding=self.base_layer.padding[0],
+                stride=self.base_layer.stride[0],
+            )
 
         result = result.to(previous_dtype)
         return result

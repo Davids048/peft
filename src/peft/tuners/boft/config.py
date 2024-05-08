@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,6 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# The implementation is based on "Parameter-Efficient Orthogonal Finetuning
+# via Butterfly Factorization" (https://arxiv.org/abs/2311.06243) in ICLR 2024.
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
@@ -29,7 +31,7 @@ class BOFTConfig(PeftConfig):
         boft_block_size (`int`): BOFT block size across different layers.
         boft_block_num (`int`): Number of BOFT blocks per injected layer.
         boft_n_butterfly_factor (`int`): Number of butterfly factors across different layers.
-        target_modules (`Union[List[str],str]`): The names of the modules to apply Lora to.
+        target_modules (`Union[List[str],str]`): The names of the modules to apply the adapter to.
         boft_dropout (`float`): The multiplicative dropout probability for BOFT layers.
         fan_in_fan_out (`bool`): Set this to True if the layer to replace stores weight like (fan_in, fan_out).
             For example, gpt-2 uses `Conv1D` which stores weights like (fan_in, fan_out) and hence this should be set
@@ -49,7 +51,7 @@ class BOFTConfig(PeftConfig):
     """
 
     boft_block_size: int = field(
-        default=0,
+        default=4,
         metadata={
             "help": "BOFT block size across different layers.",
             "note": "You can only specify either boft_block_size or boft_block_num, but not both simultaneously, because boft_block_size x boft_block_num = layer dimension.",
@@ -95,7 +97,7 @@ class BOFTConfig(PeftConfig):
             ),
         },
     )
-    init_boft_weights: bool = field(
+    init_weights: bool = field(
         default=True,
         metadata={
             "help": (
@@ -122,3 +124,10 @@ class BOFTConfig(PeftConfig):
         self.target_modules = (
             set(self.target_modules) if isinstance(self.target_modules, list) else self.target_modules
         )
+        if self.boft_block_size == 0 and self.boft_block_num == 0:
+            raise ValueError("You must specify either boft_block_size or boft_block_num.")
+        if not (self.boft_block_size != 0) ^ (self.boft_block_num != 0):
+            raise ValueError(
+                f"You can only specify either boft_block_size ({self.boft_block_size}) or boft_block_num ({self.boft_block_num}), "
+                "but not both simultaneously, because boft_block_size x boft_block_num != in_features."
+            )

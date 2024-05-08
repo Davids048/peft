@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +17,7 @@ import re
 import warnings
 from dataclasses import asdict
 from enum import Enum
-from typing import List, Optional
+from typing import Optional
 
 import torch
 from torch import nn
@@ -180,7 +179,7 @@ class IA3Model(BaseTuner):
             )
         else:
             new_module = self._create_new_module(ia3_config, adapter_name, target, **kwargs)
-            if adapter_name != self.active_adapter:
+            if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
@@ -260,6 +259,15 @@ class IA3Model(BaseTuner):
     def set_adapter(self, adapter_name: str | list[str]) -> None:
         """Set the active adapter(s).
 
+        Additionally, this function will set the specified adapters to trainable (i.e., requires_grad=True). If this is
+        not desired, use the following code.
+
+        ```py
+        >>> for name, param in model_peft.named_parameters():
+        ...     if ...:  # some check on name (ex. if 'lora' in name)
+        ...         param.requires_grad = False
+        ```
+
         Args:
             adapter_name (`str` or `list[str]`): Name of the adapter(s) to be activated.
         """
@@ -269,6 +277,7 @@ class IA3Model(BaseTuner):
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.set_adapter(adapter_name)
+        self.active_adapter = adapter_name
 
     def _prepare_adapter_config(self, peft_config, model_config):
         if peft_config.target_modules is None:
@@ -284,7 +293,7 @@ class IA3Model(BaseTuner):
         return peft_config
 
     def _unload_and_optionally_merge(
-        self, merge: bool = True, safe_merge: bool = False, adapter_names: Optional[List[str]] = None
+        self, merge: bool = True, safe_merge: bool = False, adapter_names: Optional[list[str]] = None
     ):
         r"""
         This method merges the (IA)^3 layers into the base model. This is needed if someone wants to use the base model
@@ -319,11 +328,17 @@ class IA3Model(BaseTuner):
                 self._replace_module(parent, target_name, target.get_base_layer(), target)
             elif isinstance(target, ModulesToSaveWrapper):
                 # save any additional trainable modules part of `modules_to_save`
-                setattr(parent, target_name, target.modules_to_save[target.active_adapter])
+                new_module = target.modules_to_save[target.active_adapter]
+                if hasattr(new_module, "base_layer"):
+                    # check if the module is itself a tuner layer
+                    if merge:
+                        new_module.merge(safe_merge=safe_merge, adapter_names=adapter_names)
+                    new_module = new_module.get_base_layer()
+                setattr(parent, target_name, new_module)
 
         return self.model
 
-    def merge_and_unload(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> torch.nn.Module:
+    def merge_and_unload(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> torch.nn.Module:
         r"""
         This method merges the IA³ layers into the base model. This is needed if someone wants to use the base model as
         a standalone model.

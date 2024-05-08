@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,6 +38,7 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
 
     We use parametrized.expand for debugging purposes to test each model individually.
     """
+
     transformers_class = AutoModelForSeq2SeqLM
 
     def prepare_inputs_for_testing(self):
@@ -92,6 +92,7 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
                 "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
                 "lora_kwargs": {"init_lora_weights": [False]},
                 "ia3_kwargs": {"init_ia3_weights": [False]},
+                "vera_kwargs": {"init_weights": [False]},
                 "task_type": "SEQ_2_SEQ_LM",
             },
         )
@@ -99,10 +100,28 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
     def test_merge_layers(self, test_name, model_id, config_cls, config_kwargs):
         self._test_merge_layers(model_id, config_cls, config_kwargs)
 
+    @parameterized.expand(
+        PeftTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_ENCODER_DECODER_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "task_type": "SEQ_2_SEQ_LM",
+            },
+        )
+    )
+    def test_mixed_adapter_batches(self, test_name, model_id, config_cls, config_kwargs):
+        self._test_mixed_adapter_batches(model_id, config_cls, config_kwargs)
+
     # skip non lora models - generate does not work for prefix tuning, prompt tuning
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate(self, test_name, model_id, config_cls, config_kwargs):
         self._test_generate(model_id, config_cls, config_kwargs)
+
+    # skip non lora models - generate does not work for prefix tuning, prompt tuning
+    @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
+    def test_generate_pos_args(self, test_name, model_id, config_cls, config_kwargs):
+        # positional arguments are not supported for PeftModelForSeq2SeqLM
+        self._test_generate_pos_args(model_id, config_cls, config_kwargs, raises_err=True)
 
     @parameterized.expand(PeftTestConfigManager.get_grid_parameters(FULL_GRID))
     def test_generate_half_prec(self, test_name, model_id, config_cls, config_kwargs):
@@ -151,6 +170,8 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
                 "lora_kwargs": {"init_lora_weights": [False]},
                 "adalora_kwargs": {"init_lora_weights": [False]},
                 "ia3_kwargs": {"init_ia3_weights": [False]},
+                "boft_kwargs": {"init_weights": [False]},
+                "vera_kwargs": {"init_weights": [False]},
                 "task_type": "SEQ_2_SEQ_LM",
             },
         )
@@ -181,6 +202,8 @@ class PeftEncoderDecoderModelTester(unittest.TestCase, PeftCommonTester):
                 "lora_kwargs": {"init_lora_weights": [False]},
                 "adalora_kwargs": {"init_lora_weights": [False]},
                 "ia3_kwargs": {"init_ia3_weights": [False]},
+                "boft_kwargs": {"init_weights": [False]},
+                "vera_kwargs": {"init_weights": [False]},
                 "task_type": "SEQ_2_SEQ_LM",
             },
         )
