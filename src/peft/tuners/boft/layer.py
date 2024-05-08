@@ -30,6 +30,10 @@ from torch.utils.cpp_extension import load
 
 from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 
+import os
+
+import triton
+import triton.ops
 
 os.environ["CC"] = "gcc"
 os.environ["CXX"] = "gcc"
@@ -234,7 +238,7 @@ class BOFTLayer(BaseTunerLayer):
             raise ValueError(
                 f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor+1} to be a positive integer number."
             )
-
+        print(f"=====update layer: block_size: {boft_block_size}, block_num: {boft_block_num}, n_factor: {boft_n_butterfly_factor}")
         # Initialize the MultiplicativeDropoutLayer for boft_dropout > 0.0.
         if boft_dropout > 0.0:
             boft_dropout_layer = MultiplicativeDropoutLayer(p=boft_dropout)
@@ -300,6 +304,7 @@ class BOFTLayer(BaseTunerLayer):
             )
             perm_mat = self.perm2mat(perm)
             P[i] = perm_mat
+            # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
 
         self.register_buffer("boft_P", P)
 
@@ -415,6 +420,51 @@ class BOFTLayer(BaseTunerLayer):
         Q = torch.linalg.solve(id_mat + skew_mat, id_mat - skew_mat, left=False)
 
         return Q
+
+    def batch_adapters(self, adapter_lst):
+        """
+        batch the boft_R part of each adapter layer of the input adapters
+        """
+        print("BOFT BATCHING>......")
+        for layer_name in self.adapter_layer_names:
+            print("batching adapters: ", layer_name)
+            if layer_name != "boft_R":
+                print("batching: not boft_R")
+                continue
+            else:
+                # processing boft_R 
+                batched_adapters_lst = []
+                batched_adapters_layout_lst = []
+
+                for adapter in adapter_lst:
+                    if adapter not in self.boft_R.keys():
+                        raise KeyError(f"adapter {adapter} not found in available adapters")
+                    else: 
+                        # perform preprocessing for each adapter
+                        boft_R = self.boft_R[adapter]
+                        dropout = self.boft_dropout[adapter]
+
+                        N, D, H, _ = boft_R.shape
+                        # print("boft linear layer: ", boft_R.shape)
+                        boft_R = boft_R.view(N * D, H, H)
+                        orth_rotate_butterfly = self.cayley_batch(boft_R)
+                        orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
+                        orth_rotate_butterfly = dropout(orth_rotate_butterfly)
+                        print(f"boft batching: before block diagonal: {orth_rotate_butterfly.shape}")
+                        batched_adapters_lst.append(orth_rotate_butterfly)
+
+                        # TODO: get the layout for this adapter's factors
+                        # weight dimensions: factor idx, block idx, r, c
+                        layout = [] # TODO: Update this to the true layout
+                        batched_adapters_layout_lst.append(layout)
+
+                stacked_adapters = torch.cat(batched_adapters_lst, dim=1)
+                self.boft_R["batched_adapter"] = stacked_adapters
+                print(f"boft batching: batched_adapter shape: {stacked_adapters.shape}")
+
+
+
+
 
 
 class Linear(nn.Module, BOFTLayer):
@@ -567,6 +617,7 @@ class Linear(nn.Module, BOFTLayer):
             boft_scale = torch.ones((int(self.out_features), 1), device=x.device)
 
             for active_adapter in self.active_adapters:
+                # print("forward start====", active_adapter)
                 if active_adapter not in self.boft_R.keys():
                     continue
                 boft_R = self.boft_R[active_adapter]
@@ -574,8 +625,10 @@ class Linear(nn.Module, BOFTLayer):
                 dropout = self.boft_dropout[active_adapter]
 
                 N, D, H, _ = boft_R.shape
+                # print("boft linear layer: ", boft_R.shape)
                 boft_R = boft_R.view(N * D, H, H)
                 orth_rotate_butterfly = self.cayley_batch(boft_R)
+                # print("orth_rotate_but (after caylay batch)", orth_rotate_butterfly.shape)
                 orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
                 orth_rotate_butterfly = dropout(orth_rotate_butterfly)
                 if self.fbd_cuda_available:
@@ -587,7 +640,10 @@ class Linear(nn.Module, BOFTLayer):
 
                 butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                 butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
+                # print("butterfly_oft_mat_batch:", butterfly_oft_mat_batch.shape)
+                # torch.save(block_diagonal_butterfly, "/scratch/js202/boft/boft_dreambooth/butterfly_oft_mat_batch.pt")
                 butterfly_oft_mat = butterfly_oft_mat_batch[0]
+                # print("b_oft_mat", butterfly_oft_mat.shape)
 
                 for i in range(1, butterfly_oft_mat_batch.shape[0]):
                     butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat

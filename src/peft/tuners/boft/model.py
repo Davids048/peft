@@ -332,3 +332,15 @@ class BOFTModel(BaseTuner):
         model.
         """
         return self._unload_and_optionally_merge(merge=False)
+
+    def batch_adapters(self, adapter_lst):
+        """
+        batch the boft_R part of each adapter layer of the input adapters
+        """
+        print("BOFT: batch_adapters")
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                module.batch_adapters(adapter_lst)
