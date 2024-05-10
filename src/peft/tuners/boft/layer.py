@@ -238,7 +238,7 @@ class BOFTLayer(BaseTunerLayer):
             raise ValueError(
                 f"You can only specify boft_n_butterfly_factor {boft_n_butterfly_factor+1} to be a positive integer number."
             )
-        print(f"=====update layer: block_size: {boft_block_size}, block_num: {boft_block_num}, n_factor: {boft_n_butterfly_factor}")
+        # print(f"=====update layer: block_size: {boft_block_size}, block_num: {boft_block_num}, n_factor: {boft_n_butterfly_factor}")
         # Initialize the MultiplicativeDropoutLayer for boft_dropout > 0.0.
         if boft_dropout > 0.0:
             boft_dropout_layer = MultiplicativeDropoutLayer(p=boft_dropout)
@@ -421,46 +421,6 @@ class BOFTLayer(BaseTunerLayer):
 
         return Q
 
-    def batch_adapters(self, adapter_lst):
-        """
-        batch the boft_R part of each adapter layer of the input adapters
-        """
-        print("BOFT BATCHING>......")
-        for layer_name in self.adapter_layer_names:
-            print("batching adapters: ", layer_name)
-            if layer_name != "boft_R":
-                print("batching: not boft_R")
-                continue
-            else:
-                # processing boft_R 
-                batched_adapters_lst = []
-                batched_adapters_layout_lst = []
-
-                for adapter in adapter_lst:
-                    if adapter not in self.boft_R.keys():
-                        raise KeyError(f"adapter {adapter} not found in available adapters")
-                    else: 
-                        # perform preprocessing for each adapter
-                        boft_R = self.boft_R[adapter]
-                        dropout = self.boft_dropout[adapter]
-
-                        N, D, H, _ = boft_R.shape
-                        # print("boft linear layer: ", boft_R.shape)
-                        boft_R = boft_R.view(N * D, H, H)
-                        orth_rotate_butterfly = self.cayley_batch(boft_R)
-                        orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-                        orth_rotate_butterfly = dropout(orth_rotate_butterfly)
-                        print(f"boft batching: before block diagonal: {orth_rotate_butterfly.shape}")
-                        batched_adapters_lst.append(orth_rotate_butterfly)
-
-                        # TODO: get the layout for this adapter's factors
-                        # weight dimensions: factor idx, block idx, r, c
-                        layout = [] # TODO: Update this to the true layout
-                        batched_adapters_layout_lst.append(layout)
-
-                stacked_adapters = torch.cat(batched_adapters_lst, dim=1)
-                self.boft_R["batched_adapter"] = stacked_adapters
-                print(f"boft batching: batched_adapter shape: {stacked_adapters.shape}")
 
 
 
@@ -490,6 +450,8 @@ class Linear(nn.Module, BOFTLayer):
         self.fan_in_fan_out = fan_in_fan_out
 
         self._active_adapter = adapter_name
+        self.batch_op = {} 
+        self.batch_layout = {}
 
         # Attempt to load the CUDA extension during model initialization
         if not get_fbd_cuda():
@@ -604,6 +566,7 @@ class Linear(nn.Module, BOFTLayer):
         return butterfly_oft_mat, boft_s
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+        print("forward: x shape: ", x.shape)
         previous_dtype = x.dtype
 
         if self.disable_adapters:
@@ -617,39 +580,51 @@ class Linear(nn.Module, BOFTLayer):
             boft_scale = torch.ones((int(self.out_features), 1), device=x.device)
 
             for active_adapter in self.active_adapters:
-                # print("forward start====", active_adapter)
+                print("forward start====", active_adapter)
                 if active_adapter not in self.boft_R.keys():
                     continue
-                boft_R = self.boft_R[active_adapter]
-                boft_s = self.boft_s[active_adapter]
-                dropout = self.boft_dropout[active_adapter]
-
-                N, D, H, _ = boft_R.shape
-                # print("boft linear layer: ", boft_R.shape)
-                boft_R = boft_R.view(N * D, H, H)
-                orth_rotate_butterfly = self.cayley_batch(boft_R)
-                # print("orth_rotate_but (after caylay batch)", orth_rotate_butterfly.shape)
-                orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-                orth_rotate_butterfly = dropout(orth_rotate_butterfly)
-                if self.fbd_cuda_available:
-                    block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                if active_adapter == "batched_adapter":
+                    # NOTE: Assuming we return immediately if the adapter is a 
+                    # batched_adapter. Because there is no point of cumulating
+                    # results of several adapters if 1 of them is a batched_adapter
+                    # (even the shape won't align)
+                    return self.get_batched_activation(x, *args, **kwargs)
                 else:
-                    orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
-                    block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
-                    block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                    boft_R = self.boft_R[active_adapter]
+                    boft_s = self.boft_s[active_adapter]
+                    dropout = self.boft_dropout[active_adapter]
 
-                butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
-                butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
-                # print("butterfly_oft_mat_batch:", butterfly_oft_mat_batch.shape)
-                # torch.save(block_diagonal_butterfly, "/scratch/js202/boft/boft_dreambooth/butterfly_oft_mat_batch.pt")
-                butterfly_oft_mat = butterfly_oft_mat_batch[0]
-                # print("b_oft_mat", butterfly_oft_mat.shape)
+                    N, D, H, _ = boft_R.shape
+                    # print("boft linear layer: ", boft_R.shape)
+                    boft_R = boft_R.view(N * D, H, H)
+                    orth_rotate_butterfly = self.cayley_batch(boft_R)
+                    # print("orth_rotate_but (after caylay batch)", orth_rotate_butterfly.shape)
+                    orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
+                    # orth_rotate_butterfly = dropout(orth_rotate_butterfly) # TODO: get rid of dropout for consistency
+                    print("orth_rotate_butterfly:", orth_rotate_butterfly.shape)
+                    torch.save(orth_rotate_butterfly, "/scratch/js202/boft/boft_dreambooth/orth_rotate_butterfly.pt")
 
-                for i in range(1, butterfly_oft_mat_batch.shape[0]):
-                    butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
+                    if self.fbd_cuda_available:
+                        block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                    else:
+                        orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+                        block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                        block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                    print("block_diagonal_butterfly:", block_diagonal_butterfly.shape)
+                    torch.save(block_diagonal_butterfly, "/scratch/js202/boft/boft_dreambooth/block_diagonal_butterfly.pt")
 
-                boft_rotation = butterfly_oft_mat @ boft_rotation
-                boft_scale = boft_s * boft_scale
+                    butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
+                    butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
+                    print("butterfly_oft_mat_batch:", butterfly_oft_mat_batch.shape)
+                    torch.save(butterfly_oft_mat_batch, "/scratch/js202/boft/boft_dreambooth/butterfly_oft_mat_batch.pt")
+                    butterfly_oft_mat = butterfly_oft_mat_batch[0]
+                    print("b_oft_mat", butterfly_oft_mat.shape)
+
+                    for i in range(1, butterfly_oft_mat_batch.shape[0]):
+                        butterfly_oft_mat = butterfly_oft_mat_batch[i] @ butterfly_oft_mat
+
+                    boft_rotation = butterfly_oft_mat @ boft_rotation
+                    boft_scale = boft_s * boft_scale
 
             x = x.to(self.get_base_layer().weight.data.dtype)
 
@@ -658,16 +633,222 @@ class Linear(nn.Module, BOFTLayer):
             rotated_weight = torch.mm(boft_rotation, orig_weight)
             rotated_weight = torch.transpose(rotated_weight, 0, 1)
 
-            scaled_rotated_weight = rotated_weight * boft_scale
+            # scaled_rotated_weight = rotated_weight * boft_scale
+            scaled_rotated_weight = rotated_weight # TODO: removed scale for consistency
+            print(f"forward: scaled_rotated_weight: shape: {scaled_rotated_weight.shape}")
 
             result = F.linear(input=x, weight=scaled_rotated_weight, bias=self.base_layer.bias)
 
         result = result.to(previous_dtype)
+        print("====forward end====")
         return result
 
     def __repr__(self) -> str:
         rep = super().__repr__()
         return "boft." + rep
+
+    def batch_adapters(self, adapter_lst):
+        """
+        batch the boft_R part of each adapter layer of the input adapters
+        """
+        print("BOFT BATCHING>......")
+        for layer_name in self.adapter_layer_names:
+            print("batching adapters: ", layer_name)
+            # NOTE: we only batch boft_R for now. 
+            if layer_name != "boft_R":
+                print("batching: not boft_R")
+                continue
+            else:
+                # processing boft_R 
+                batched_adapters_lst = []
+                batched_adapters_layout_lst = []
+                block_size = 0
+
+                for adapter in adapter_lst:
+                    if adapter not in self.boft_R.keys():
+                        raise KeyError(f"adapter {adapter} not found in available adapters")
+                    else: 
+                        # perform preprocessing for each adapter
+                        boft_R = self.boft_R[adapter]
+                        dropout = self.boft_dropout[adapter]
+
+                        N, D, H, _ = boft_R.shape
+
+                        # get the layout for this adapter's factors
+                        n_factors = N
+                        sub_block_size = int(H//2)
+                        layout = self.create_block_diag_layout(2, D, n_factors)
+                        print(f"base_layout: {layout.shape} {layout}\n\t")
+                        batched_adapters_layout_lst.append(layout.unsqueeze(1))
+
+                        # turn boft_R into butterfly structure
+                        boft_R = boft_R.view(N * D, H, H)
+                        orth_rotate_butterfly = self.cayley_batch(boft_R)
+                        orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
+                        # orth_rotate_butterfly = dropout(orth_rotate_butterfly) # TODO: get rid of dropout for consistency
+
+                        if self.fbd_cuda_available:
+                            block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                        else:
+                            orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+                            block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                            block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                        butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
+                        butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
+                        print(f"batching: butterfly_oft_mat_batch, {butterfly_oft_mat_batch.shape}") # factor * m * n
+                
+
+                                        # # TODO: transform adaptor to use subblock (so that they matches with layout)
+                                        # block_size = H # original block size
+                                        # sub_block_size = int(block_size//2)
+                                        # sub_block_cnt = D * 4 # D: number of blocks, each block is 2*2 sub blocks
+                                        # orth_rotate_butterfly_subblock = orth_rotate_butterfly.\
+                                        #     unfold(2, sub_block_size, sub_block_size).\
+                                        #     unfold(3, sub_block_size, sub_block_size).contiguous().view(-1, sub_block_cnt,sub_block_size,sub_block_size)
+                                        # print(f"orth_rotate_butterfly_subblock: shape: {orth_rotate_butterfly_subblock.shape}")
+
+                        batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1)) # factor * 1 (batch) * m * n
+
+                # create a unified layout for all adapters
+                stacked_layouts = torch.cat(batched_adapters_layout_lst, dim=1)
+                print(f"boft batching: batched layouts shape: {stacked_layouts.shape}") # factors * batch * m * n
+
+                # Stack the adapters together
+                stacked_adapters = torch.cat(batched_adapters_lst, dim=1)
+                print(f"stacked_full adapters: {stacked_adapters.shape}") # factor * batch * m * n 
+                # sparsify adapters
+                each_step_factors_shape = [1, stacked_adapters.shape[1], stacked_adapters.shape[2],stacked_adapters.shape[3]]
+                factors_by_step_lst = []
+                for i in range(n_factors):
+                    cur_step_factors = self.sparsify_tensor(stacked_adapters[i].view(each_step_factors_shape),
+                                                            mask=stacked_layouts[i],
+                                                            block=sub_block_size)
+                    print("cur_step_factors",cur_step_factors.shape)
+                    factors_by_step_lst.append(cur_step_factors)
+                sparse_stacked_adapters = torch.cat(factors_by_step_lst, dim=0)
+                self.boft_R["batched_adapter"] = sparse_stacked_adapters
+                print(f"boft batching: batched_adapter shape: {sparse_stacked_adapters.shape}") # factor * blocks * m * n
+
+
+                ops_lst = []
+                sub_block_size = int(H//2) 
+                print(f"sub_block_size: {sub_block_size}")
+                for i in range(n_factors):
+                    batch_op = triton.ops.blocksparse.matmul(stacked_layouts[i], sub_block_size, "dds", device="cuda")
+                    ops_lst.append(batch_op)
+                # Create a triton op based on layout
+                self.batch_op["batched_adapter"] = ops_lst
+                self.batch_layout["batched_adapter"] = batched_adapters_layout_lst
+                self.set_adapter("batched_adapter")
+    
+    def sparsify_tensor(self, x, mask, block):
+        """
+        Create a sparse representation of the original matrix x.
+        @params:
+            x: the original tensor
+            mask: the layout we use to sparsify the tenosr
+            block: block size that each mask bit represents
+        """
+        print("sparsify: x shape:", x.shape)
+        print("sparsify: mask: ", mask.shape)
+        # print(f'mask sum: {mask.sum()}')
+        ret = torch.empty((x.size(0), mask.sum(), block, block), dtype=x.dtype, device=x.device)
+        for idx, (h, i, j) in enumerate(zip(*mask.nonzero(as_tuple=True))):
+            ret[:, idx, :, :] = x[:, h, i * block:(i + 1) * block, j * block:(j + 1) * block]
+        return ret
+
+    
+    def create_block_diag_layout(self, block_size, num_blocks, n_factors):
+        """
+        Create the layout for the blocks
+        Args:
+        block_size: the size of each block in the 1st factor
+        num_blocks: the number of blocks in the first factor, which is also the 
+            amount of blocks stored in the boft_R attr. 
+        n_factors: the number of factors 
+
+        Returns:
+        The layout of each factor, stacked together in 1 matrix. 
+        """
+        print(f"create_block_diag_layout:block size: {block_size}, num_blocks {num_blocks}, nfactors {n_factors}")
+        # Create a block of ones
+        block = torch.ones((block_size, block_size))
+        
+        # Initialize an empty matrix for the final block diagonal matrix
+        dim = block_size * num_blocks # side length of the factor layout
+        matrix = torch.zeros((dim, dim))
+        
+        # Place each block on the diagonal
+        for i in range(num_blocks):
+            start_idx = i * block_size
+            matrix[start_idx:start_idx+block_size, start_idx:start_idx+block_size] = block
+
+        matrix_stack = torch.stack([matrix for _ in range(n_factors)])
+
+        perm_lst = []
+        for i in range(n_factors):
+            # get permutation
+            perm = self.block_butterfly_perm(dim, int(num_blocks//2**i), int(block_size/2), n_factors)
+            # perm = self.block_butterfly_perm(dim, int(num_blocks//2**i), int(block_size/2), 0)
+            perm_mat = self.perm2mat(perm)
+            perm_lst.append(perm_mat)
+        perm_stack = torch.stack(perm_lst)
+
+        layout = torch.bmm(matrix_stack, perm_stack.permute(0,2,1))
+        layout = torch.bmm(perm_stack, layout)
+
+        layout = layout.to(torch.int)
+        return layout
+    
+    def get_batched_activation(self, x: torch.Tensor, *args, **kwargs):
+        """
+        Use the batched adapter and compiled triton op, calculate the 
+        """
+        previous_type = x.dtype
+        print(f"getting batched activation")
+
+        # x * base weight
+        result = self.base_layer(x, *args, **kwargs)
+
+        # remove bias for now (add at the end)
+        base_layer = self.get_base_layer()
+        base_bias = base_layer.bias
+        if base_bias is not None:
+            result = result - base_bias.data
+
+        # transform result to 4d on the 2nd dim (1st is for factors)
+        result = result.unsqueeze(0)
+
+        # process base_weight * boft weight
+        boft_R = self.boft_R["batched_adapter"]
+        print(f"batch activation: boft_R shape: {boft_R.shape}")
+        op_lst = self.batch_op["batched_adapter"]
+
+        # use triton op (created for each factor, to multiply the weights)
+        for i in range(len(op_lst)):
+            op = op_lst[i]
+            print(f"factor {i}, result: {result.shape}, boft factor: {boft_R[i:i+1, :,:,:].shape}")
+            result = op(result, boft_R[i:i+1, :,:,:])
+        print(f"batch activation: rotated weight: shape: {result.shape}")
+
+        # process result * scale up
+        # result = result * self.boft_s["batched_adapter"] # TODO: removed this for consistency
+        print(f"batch activation: result: shape: {result.shape}")
+
+        # tranform to fit forward pass
+        result = result.squeeze(0)
+
+        if base_bias is not None:
+            result = result + base_bias.data
+        
+
+
+        result = result.to(previous_type)
+        return result
+        
+
+
+
 
 
 class Conv2d(nn.Module, BOFTLayer):
