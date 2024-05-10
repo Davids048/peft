@@ -695,17 +695,6 @@ class Linear(nn.Module, BOFTLayer):
                             block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
                         butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                         butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
-                        print(f"batching: butterfly_oft_mat_batch, {butterfly_oft_mat_batch.shape}") # factor * m * n
-                
-
-                                        # # TODO: transform adaptor to use subblock (so that they matches with layout)
-                                        # block_size = H # original block size
-                                        # sub_block_size = int(block_size//2)
-                                        # sub_block_cnt = D * 4 # D: number of blocks, each block is 2*2 sub blocks
-                                        # orth_rotate_butterfly_subblock = orth_rotate_butterfly.\
-                                        #     unfold(2, sub_block_size, sub_block_size).\
-                                        #     unfold(3, sub_block_size, sub_block_size).contiguous().view(-1, sub_block_cnt,sub_block_size,sub_block_size)
-                                        # print(f"orth_rotate_butterfly_subblock: shape: {orth_rotate_butterfly_subblock.shape}")
 
                         batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1)) # factor * 1 (batch) * m * n
 
@@ -807,14 +796,16 @@ class Linear(nn.Module, BOFTLayer):
         previous_type = x.dtype
         print(f"getting batched activation")
 
-        # x * base weight
-        result = self.base_layer(x, *args, **kwargs)
+        # # x * base weight
+        # result = self.base_layer(x, *args, **kwargs)
 
-        # remove bias for now (add at the end)
-        base_layer = self.get_base_layer()
-        base_bias = base_layer.bias
-        if base_bias is not None:
-            result = result - base_bias.data
+        # # remove bias for now (add at the end)
+        # base_layer = self.get_base_layer()
+        # base_bias = base_layer.bias
+        # if base_bias is not None:
+        #     result = result - base_bias.data
+
+        result = x
 
         # transform result to 4d on the 2nd dim (1st is for factors)
         result = result.unsqueeze(0)
@@ -835,12 +826,14 @@ class Linear(nn.Module, BOFTLayer):
         # result = result * self.boft_s["batched_adapter"] # TODO: removed this for consistency
         print(f"batch activation: result: shape: {result.shape}")
 
+
         # tranform to fit forward pass
         result = result.squeeze(0)
+        result = result.to(self.get_base_layer().weight.data.dtype)
 
-        if base_bias is not None:
-            result = result + base_bias.data
-        
+        # if base_bias is not None:
+        #     result = result + base_bias.data
+        result =  self.base_layer(result, *args, **kwargs)  
 
 
         result = result.to(previous_type)
