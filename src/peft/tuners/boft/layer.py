@@ -452,6 +452,7 @@ class Linear(nn.Module, BOFTLayer):
         self._active_adapter = adapter_name
         self.batch_op = {} 
         self.batch_layout = {}
+        self.batched_adapters = [] # stores the name of the currently batched adapters
 
         # Attempt to load the CUDA extension during model initialization
         if not get_fbd_cuda():
@@ -668,6 +669,7 @@ class Linear(nn.Module, BOFTLayer):
                     if adapter not in self.boft_R.keys():
                         raise KeyError(f"adapter {adapter} not found in available adapters")
                     else: 
+                        self.batched_adapters.append(adapter)
                         # perform preprocessing for each adapter
                         boft_R = self.boft_R[adapter]
                         dropout = self.boft_dropout[adapter]
@@ -697,6 +699,16 @@ class Linear(nn.Module, BOFTLayer):
                         butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
 
                         batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1)) # factor * 1 (batch) * m * n
+
+                        # move each single adapter out of cuda
+                        print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
+                        boft_R_gpu = self.boft_R[adapter]
+                        boft_R_cpu = boft_R_gpu.to('cpu')
+                        self.boft_R[adapter] = boft_R_cpu
+                        del boft_R_gpu
+                        torch.cuda.empty_cache()  # Clear CUDA cache if necessary
+                        # print("original layer: ", type(layer), "device:", layer.device)
+                        print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
 
                 # create a unified layout for all adapters
                 stacked_layouts = torch.cat(batched_adapters_layout_lst, dim=1)
@@ -729,7 +741,30 @@ class Linear(nn.Module, BOFTLayer):
                 self.batch_op["batched_adapter"] = ops_lst
                 self.batch_layout["batched_adapter"] = batched_adapters_layout_lst
                 self.set_adapter("batched_adapter")
-    
+
+    def unbatch_adapters(self, adapter_lst):
+        """
+        Put the adapters in self.batched_adapters back to cuda
+        """
+        print("--unbatching adapters--")
+        for layer_name in self.adapter_layer_names:
+            if layer_name == "boft_R":
+                for adapter in adapter_lst:
+
+                    if adapter not in self.batched_adapters:
+                        raise KeyError(f"adapter {adapter} not found in batched adapters")    
+                                        
+                    layer = self.boft_R[adapter]
+                    # put the layer back to cuda
+
+                    print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
+                    layer_gpu = layer.to('cuda')
+                    self.boft_R[adapter] = layer_gpu
+                    del layer
+                    torch.cuda.empty_cache()  # Clear CUDA cache if necessary
+                    # print("original layer: ", type(layer), "device:", layer.device)
+                    print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
+                    
     def sparsify_tensor(self, x, mask, block):
         """
         Create a sparse representation of the original matrix x.

@@ -344,3 +344,14 @@ class BOFTModel(BaseTuner):
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.batch_adapters(adapter_lst)
+
+    def unbatch_adapters(self, adapter_lst):
+        """
+        Put the adapters in adapter_lst back to cuda
+        """
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                module.unbatch_adapters(adapter_lst)
