@@ -355,3 +355,15 @@ class BOFTModel(BaseTuner):
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.unbatch_adapters(adapter_lst)
+    
+    def move_all_boft_r_s_to_cpu(self, exclude_adapters=[]):
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                for adapter in module._all_available_adapter_names():
+                    if adapter not in exclude_adapters:
+                        module.move_boft_R_to_cpu(adapter)
+                        module.move_boft_s_to_cpu(adapter)
+                        module.move_boft_p_to_cpu()

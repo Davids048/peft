@@ -695,6 +695,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             peft_config ([`PeftConfig`]):
                 The configuration of the adapter to be added.
         """
+        print("add adapter start") # TODO: REMOVE THIS
         if peft_config.peft_type != self.peft_type:
             raise ValueError(
                 f"Cannot combine adapters with different peft types. "
@@ -722,6 +723,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             raise
 
         self.set_additional_trainable_modules(peft_config, adapter_name)
+        print("add adapter end") # TODO: REMOVE THIS
 
     def set_additional_trainable_modules(self, peft_config, adapter_name):
         if getattr(peft_config, "modules_to_save", None) is not None:

@@ -34,6 +34,7 @@ import os
 
 import triton
 import triton.ops
+import gc
 
 os.environ["CC"] = "gcc"
 os.environ["CXX"] = "gcc"
@@ -66,6 +67,15 @@ def get_fbd_cuda():
 
     _FBD_CUDA = fbd_cuda
     return _FBD_CUDA
+
+def unload_cuda_module():
+    # print(f"before unload cuda: {torch.cuda.memory_allocated()}")
+    global _FBD_CUDA
+    _FBD_CUDA = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    # print(f"after  unload cuda: {torch.cuda.memory_allocated()}")
+
 
 
 class FastBlockDiag(Function):
@@ -328,6 +338,94 @@ class BOFTLayer(BaseTunerLayer):
         self.boft_block_num[adapter_name] = boft_block_num
 
         self.set_adapter(self.active_adapters)
+
+    def move_boft_R_to_cpu(self, adapter):
+        if self.boft_R[adapter].is_cuda:
+            print("moveing boft_R to CPU")
+            boft_R_gpu = self.boft_R[adapter]
+            self.boft_R[adapter] = boft_R_gpu.to('cpu')
+            torch.cuda.synchronize()
+            del boft_R_gpu
+            torch.cuda.empty_cache()
+            print("boft_R moved to cpu:", self.boft_R[adapter].device)
+        else:
+            print("boft_R is not on GPU, not moving to CPU")
+    
+    def move_boft_R_to_gpu(self, adapter):
+        """
+        Move the adapter's boft_R weight to GPU (if it is not on cuda)
+        """
+        if not self.boft_R[adapter].is_cuda:
+            boft_R_cpu = self.boft_R[adapter]
+            if self.base_layer.weight.is_cuda:
+                boft_R_gpu = boft_R_cpu.to(self.base_layer.weight.device)
+                torch.cuda.synchronize()
+                self.boft_R[adapter] = boft_R_gpu
+                del boft_R_cpu
+            else:
+                raise RuntimeError(f"base weight is on {self.base_layer.weight.device}- CUDA device error")
+            
+    def move_boft_s_to_cpu(self, adapter):
+        if self.boft_s[adapter].is_cuda:
+            print("moveing boft_s to CPU")
+            boft_s_gpu = self.boft_s[adapter]
+            self.boft_s[adapter] = boft_s_gpu.to('cpu')
+            torch.cuda.synchronize()
+            del boft_s_gpu
+            torch.cuda.empty_cache()
+            print(self.boft_s[adapter].device)
+        else:
+            print("boft_s is not on GPU, not moving to CPU")
+
+    def move_boft_s_to_gpu(self, adapter):
+        """
+        Move the adapter's boft_s weight to GPU (if it is not on cuda)
+        """
+        if not self.boft_s[adapter].is_cuda:
+            boft_s_cpu = self.boft_s[adapter]
+            if self.base_layer.weight.is_cuda:
+                boft_s_gpu = boft_s_cpu.to(self.base_layer.weight.device)
+                torch.cuda.synchronize()
+                self.boft_s[adapter] = boft_s_gpu
+                del boft_s_cpu
+            else:
+                raise RuntimeError(f"base weight is on {self.base_layer.weight.device}- CUDA device error")
+
+    def move_boft_p_to_cpu(self):
+        """
+        TODO: REMOVE THIS FUNCTION if needed 
+        Move stuff we don't need to cpu, so that it doesn't occupy gpu
+        when updating layers, all the boft_P... etc matrices are moved to GPU,
+        this is very costly, as that is a big matrix (e.g. in llama2, each 
+        boft_P is 4096 * 4096). 
+        """
+        print(f"\nboft before clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
+
+        boft_P_gpu = self.boft_P 
+        # print(f"boft_P: {boft_P_gpu.device}")
+        boft_P_cpu = boft_P_gpu.to('cpu')
+        torch.cuda.synchronize()
+        self.boft_P = boft_P_cpu
+        del boft_P_gpu
+        torch.cuda.empty_cache()
+
+        print(f"boft after  clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
+    
+    def move_boft_p_to_gpu(self):
+        if not self.boft_P.is_cuda:
+            boft_p_cpu = self.boft_P
+            if self.base_layer.weight.is_cuda:
+                print("base layer device: ", self.base_layer.weight.device)
+                self.boft_P = self.boft_P.to(self.base_layer.weight.device)
+                # boft_p_gpu = boft_p_cpu.to(self.base_layer.weight.device)
+                # self.boft_p = boft_p_gpu
+                # del boft_p_cpu
+                torch.cuda.synchronize()
+                print(f"moved p to gpu: {self.boft_P.device}")
+            else:
+                raise RuntimeError(f"base weight is on {self.base_layer.weight.device}- CUDA device error")
+        else:
+            print("boft_P is on GPU already")
 
     def reset_boft_parameters(self, adapter_name, init_weights):
         """
@@ -670,6 +768,10 @@ class Linear(nn.Module, BOFTLayer):
                         if adapter not in self.boft_R.keys():
                             raise KeyError(f"adapter {adapter} not found in available adapters")
                         else: 
+                            self.move_boft_R_to_gpu(adapter=adapter)
+                            print(f"boft_R {self.boft_R[adapter].device}")
+                            self.move_boft_p_to_gpu()
+                            print(f"boft_p {self.boft_P.device}")
                             self.batched_adapters.append(adapter)
                             # perform preprocessing for each adapter
                             boft_R = self.boft_R[adapter]
@@ -692,25 +794,23 @@ class Linear(nn.Module, BOFTLayer):
 
 
                             # move each single adapter out of cuda
-                            # print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
-                            boft_R_gpu = self.boft_R[adapter]
-                            boft_R_cpu = boft_R_gpu.to('cpu')
-                            self.boft_R[adapter] = boft_R_cpu
-                            del boft_R_gpu
-                            torch.cuda.empty_cache()  # Clear CUDA cache if necessary
-                            # print("original layer: ", type(layer), "device:", layer.device)
-                            # print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
+                            self.move_boft_R_to_cpu(adapter)
+                            print(f"boft_R {self.boft_R[adapter].device}")
+
 
                             if self.fbd_cuda_available:
                                 block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                                print(f"fbd_cuda available block_diagonal_butterfly, {block_diagonal_butterfly.shape}")
                             else:
                                 orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
                                 block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
                                 block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                            torch.cuda.synchronize()
                             butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                             butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
 
                             batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1)) # factor * 1 (batch) * m * n
+                            unload_cuda_module()
 
 
                     # create a unified layout for all adapters
@@ -743,15 +843,19 @@ class Linear(nn.Module, BOFTLayer):
                     # Create a triton op based on layout
                     self.batch_op["batched_adapter"] = ops_lst
 
-                    # TODO: remove storing layout, we don't actually use it
-                    # self.batch_layout["batched_adapter"] = batched_adapters_layout_lst
 
                     self.set_adapter("batched_adapter")
+        self.move_boft_p_to_cpu()
 
     def unbatch_adapters(self, adapter_lst):
         """
         Put the adapters in self.batched_adapters back to cuda
         """
+        # batching moved fdb_cuda out of gpu. we load it again here for later use
+        global _FBD_CUDA
+        if _FBD_CUDA == None:
+            get_fbd_cuda()
+
         print("--unbatching adapters--")
         device = self.boft_R["batched_adapter"].device
         for layer_name in self.adapter_layer_names:
@@ -836,7 +940,7 @@ class Linear(nn.Module, BOFTLayer):
         Use the batched adapter and compiled triton op, calculate the 
         """
         previous_type = x.dtype
-        # print(f"getting batched activation")
+        print(f"getting batched activation")
         with torch.no_grad():
             result = x
 
