@@ -192,6 +192,7 @@ class BOFTLayer(BaseTunerLayer):
         self.base_layer = base_layer
         self.boft_block_size = {}
         self.boft_block_num = {}
+        self.n_butterfly_factors = {}
         self.boft_dropout = nn.ModuleDict({})
         self.boft_R = nn.ParameterDict({})
         self.boft_s = nn.ParameterDict({})
@@ -307,16 +308,42 @@ class BOFTLayer(BaseTunerLayer):
                 raise ValueError(f"boft_block_size ({boft_block_size}) must be an even number!")
 
         # If there is no butterfly factor, then permutation matrix P will be an identity matrix.
-        P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
-        for i in range(boft_n_butterfly_factor + 1):
-            perm = self.block_butterfly_perm(
-                self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
-            )
-            perm_mat = self.perm2mat(perm)
-            P[i] = perm_mat
-            # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
+        # check if we need to update P
+        curr_adapter = self.active_adapter if isinstance(self.active_adapter, str) else self.active_adapter[0]
 
-        self.register_buffer("boft_P", P)
+        if curr_adapter in self.boft_block_num.keys():
+            
+            if boft_block_num != self.boft_block_num[curr_adapter] or \
+                boft_block_size != self.boft_block_size[curr_adapter] or \
+                boft_n_butterfly_factor != self.n_butterfly_factors[curr_adapter]:
+                # P is different, we need to calculate.
+                P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
+                for i in range(boft_n_butterfly_factor + 1):
+                    perm = self.block_butterfly_perm(
+                        self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
+                    )
+                    perm_mat = self.perm2mat(perm)
+                    P[i] = perm_mat
+                    # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
+                self.register_buffer("boft_P", P)
+                # print("registerd boft_P")
+            else:
+                # print("boft_P does not need update")
+                pass
+        else:
+            # P is different, we need to calculate.
+            P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
+            for i in range(boft_n_butterfly_factor + 1):
+                perm = self.block_butterfly_perm(
+                    self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
+                )
+                perm_mat = self.perm2mat(perm)
+                P[i] = perm_mat
+                # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
+            self.register_buffer("boft_P", P)
+            # print("registerd first boft_P")
+
+
 
         self.boft_R[adapter_name] = nn.Parameter(
             torch.zeros(boft_n_butterfly_factor + 1, boft_block_num, boft_block_size, boft_block_size)
@@ -336,7 +363,7 @@ class BOFTLayer(BaseTunerLayer):
         # set the boft block size and number
         self.boft_block_size[adapter_name] = boft_block_size
         self.boft_block_num[adapter_name] = boft_block_num
-
+        self.n_butterfly_factors[adapter_name] = boft_n_butterfly_factor
         self.set_adapter(self.active_adapters)
 
     def move_boft_R_to_cpu(self, adapter):
@@ -408,7 +435,7 @@ class BOFTLayer(BaseTunerLayer):
             self.boft_P = boft_P_cpu
             del boft_P_gpu
             torch.cuda.empty_cache()
-            print("moved boft_P to cpu")
+            # print("moved boft_P to cpu")
 
         # print(f"boft after  clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
     
@@ -416,13 +443,10 @@ class BOFTLayer(BaseTunerLayer):
         if not self.boft_P.is_cuda:
             boft_p_cpu = self.boft_P
             if self.base_layer.weight.is_cuda:
-                print("base layer device: ", self.base_layer.weight.device)
+                # print("base layer device: ", self.base_layer.weight.device)
                 self.boft_P = self.boft_P.to(self.base_layer.weight.device)
-                # boft_p_gpu = boft_p_cpu.to(self.base_layer.weight.device)
-                # self.boft_p = boft_p_gpu
-                # del boft_p_cpu
                 torch.cuda.synchronize()
-                print(f"moved p to gpu: {self.boft_P.device}")
+                # print(f"moved p to gpu: {self.boft_P.device}")
             else:
                 raise RuntimeError(f"base weight is on {self.base_layer.weight.device}- CUDA device error")
         else:
