@@ -1039,6 +1039,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         # extract the 0th adapter's config as the batched_adapter's config
         config = self.peft_config[adapter_lst[0]]
         self.add_adapter("batched_adapter", config)
+        self.base_model.move_all_boft_r_s_to_cpu() # clear out memory 
 
         # batch adapters
         self.base_model.batch_adapters(adapter_lst)

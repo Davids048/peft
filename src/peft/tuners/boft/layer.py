@@ -341,15 +341,15 @@ class BOFTLayer(BaseTunerLayer):
 
     def move_boft_R_to_cpu(self, adapter):
         if self.boft_R[adapter].is_cuda:
-            print("moveing boft_R to CPU")
             boft_R_gpu = self.boft_R[adapter]
             self.boft_R[adapter] = boft_R_gpu.to('cpu')
             torch.cuda.synchronize()
             del boft_R_gpu
             torch.cuda.empty_cache()
-            print("boft_R moved to cpu:", self.boft_R[adapter].device)
+            # print("boft_R moved to cpu:", self.boft_R[adapter].device)
         else:
-            print("boft_R is not on GPU, not moving to CPU")
+            # print("boft_R is not on GPU, not moving to CPU")
+            pass
     
     def move_boft_R_to_gpu(self, adapter):
         """
@@ -367,15 +367,15 @@ class BOFTLayer(BaseTunerLayer):
             
     def move_boft_s_to_cpu(self, adapter):
         if self.boft_s[adapter].is_cuda:
-            print("moveing boft_s to CPU")
             boft_s_gpu = self.boft_s[adapter]
             self.boft_s[adapter] = boft_s_gpu.to('cpu')
             torch.cuda.synchronize()
             del boft_s_gpu
             torch.cuda.empty_cache()
-            print(self.boft_s[adapter].device)
+            # print(self.boft_s[adapter].device)
         else:
-            print("boft_s is not on GPU, not moving to CPU")
+            # print("boft_s is not on GPU, not moving to CPU")
+            pass
 
     def move_boft_s_to_gpu(self, adapter):
         """
@@ -399,17 +399,18 @@ class BOFTLayer(BaseTunerLayer):
         this is very costly, as that is a big matrix (e.g. in llama2, each 
         boft_P is 4096 * 4096). 
         """
-        print(f"\nboft before clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
+        # print(f"\nboft before clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
+        if self.boft_P.is_cuda:
+            boft_P_gpu = self.boft_P 
+            # print(f"boft_P: {boft_P_gpu.device}")
+            boft_P_cpu = boft_P_gpu.to('cpu')
+            torch.cuda.synchronize()
+            self.boft_P = boft_P_cpu
+            del boft_P_gpu
+            torch.cuda.empty_cache()
+            print("moved boft_P to cpu")
 
-        boft_P_gpu = self.boft_P 
-        # print(f"boft_P: {boft_P_gpu.device}")
-        boft_P_cpu = boft_P_gpu.to('cpu')
-        torch.cuda.synchronize()
-        self.boft_P = boft_P_cpu
-        del boft_P_gpu
-        torch.cuda.empty_cache()
-
-        print(f"boft after  clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
+        # print(f"boft after  clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
     
     def move_boft_p_to_gpu(self):
         if not self.boft_P.is_cuda:
@@ -796,20 +797,32 @@ class Linear(nn.Module, BOFTLayer):
                             # move each single adapter out of cuda
                             self.move_boft_R_to_cpu(adapter)
                             print(f"boft_R {self.boft_R[adapter].device}")
+                            torch.cuda.synchronize()
 
-
-                            if self.fbd_cuda_available:
-                                block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
-                                print(f"fbd_cuda available block_diagonal_butterfly, {block_diagonal_butterfly.shape}")
-                            else:
-                                orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
-                                block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                            # if not self.fbd_cuda_available:
+                            #     block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
+                            #     torch.cuda.synchronize()
+                            #     print(f"fbd_cuda available block_diagonal_butterfly, {block_diagonal_butterfly.shape}")
+                            # else:
+                            #     orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
+                            #     block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
+                            #     block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                            
+                            block_diagonal_butterfly_lst = []
+                            for i in range(orth_rotate_butterfly.shape[0]):
+                                block_diagonal_butterfly = torch.block_diag(
+                                    *torch.unbind(orth_rotate_butterfly[i])
+                                )
                                 block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                                block_diagonal_butterfly_lst.append(block_diagonal_butterfly)
+                            block_diagonal_butterfly = torch.cat(block_diagonal_butterfly_lst, dim=0)
+
+
                             torch.cuda.synchronize()
                             butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
                             butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
 
-                            batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1)) # factor * 1 (batch) * m * n
+                            batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1).to('cpu')) # factor * 1 (batch) * m * n
                             unload_cuda_module()
 
 
@@ -818,7 +831,7 @@ class Linear(nn.Module, BOFTLayer):
                     # print(f"boft batching: batched layouts shape: {stacked_layouts.shape}") # factors * batch * m * n
 
                     # Stack the adapters together
-                    stacked_adapters = torch.cat(batched_adapters_lst, dim=1)
+                    stacked_adapters = torch.cat(batched_adapters_lst, dim=1).to(self.base_layer.weight.device)
                     # print(f"stacked_full adapters: {stacked_adapters.shape}") # factor * batch * m * n 
                     # sparsify adapters
                     each_step_factors_shape = [1, stacked_adapters.shape[1], stacked_adapters.shape[2],stacked_adapters.shape[3]]
