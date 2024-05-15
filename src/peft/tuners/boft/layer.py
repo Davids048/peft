@@ -901,17 +901,9 @@ class Linear(nn.Module, BOFTLayer):
 
                     if adapter not in self.batched_adapters:
                         raise KeyError(f"adapter {adapter} not found in batched adapters")    
-                                        
-                    layer = self.boft_R[adapter]
-                    # put the layer back to cuda
-
-                    print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
-                    layer_gpu = layer.to(device)
-                    self.boft_R[adapter] = layer_gpu
-                    del layer
-                    torch.cuda.empty_cache()  # Clear CUDA cache if necessary
-                    # print("original layer: ", type(layer), "device:", layer.device)
-                    print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
+                    self.move_boft_s_to_gpu(adapter)
+                    self.move_boft_R_to_gpu(adapter)                    
+        self.move_boft_p_to_gpu()
                     
     def sparsify_tensor(self, x, mask, block):
         """
