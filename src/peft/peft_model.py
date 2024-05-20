@@ -1044,7 +1044,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         # batch adapters
         self.base_model.batch_adapters(adapter_lst)
-        print("after batch adapter:\n", self.base_model)
+        print("model finished batching")
 
         # QUESTION: update config?
         # NOTE: currently peft enforces the shape to be consistent. But after 

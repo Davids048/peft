@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .config import BOFTConfig
-from .layer import BOFTLayer
+from .layer import BOFTLayer, Linear, MultiplicativeDropoutLayer
 from .model import BOFTModel
 
 

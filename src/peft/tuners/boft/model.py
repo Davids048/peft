@@ -338,12 +338,42 @@ class BOFTModel(BaseTuner):
         batch the boft_R part of each adapter layer of the input adapters
         """
         print("BOFT: batch_adapters")
-        for module in self.model.modules():
-            if isinstance(module, BOFTLayer):
+        streams = []  # List to hold the streams
+        operations = []  # List to hold the operations to be executed in each stream
+
+        # Define the operation to be done in this stream
+        def process_module(module, adapter_lst, stream):
+            with torch.cuda.stream(stream):
                 if module.merged:
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.batch_adapters(adapter_lst)
+
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                # Create a new stream for each BOFTLayer
+                stream = torch.cuda.Stream()
+                streams.append(stream)
+
+                
+
+                # Append the operation with its specific stream and module
+                operations.append((module, adapter_lst, stream))
+
+        # Execute all operations in their respective streams
+        for module, adapter_lst, stream in operations:
+            process_module(module, adapter_lst, stream)
+
+        # Synchronize all streams to ensure all operations are completed
+        torch.cuda.synchronize()
+
+        # print("BOFT: batch_adapters")
+        # for module in self.model.modules():
+        #     if isinstance(module, BOFTLayer):
+        #         if module.merged:
+        #             warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+        #             module.unmerge()
+        #         module.batch_adapters(adapter_lst)
 
     def unbatch_adapters(self, adapter_lst):
         """
