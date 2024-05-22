@@ -208,6 +208,9 @@ class BOFTLayer(BaseTunerLayer):
         self.merged_adapters = []
         self.kwargs = kwargs
 
+        # fields for batched ops
+        self.boft_R_cpu = nn.ParameterDict({})
+
         base_layer = self.get_base_layer()
 
         if isinstance(base_layer, nn.Linear):
@@ -376,8 +379,12 @@ class BOFTLayer(BaseTunerLayer):
     def move_boft_R_to_cpu(self, adapter):
         if self.boft_R[adapter].is_cuda:
             boft_R_gpu = self.boft_R[adapter]
-            self.boft_R[adapter] = boft_R_gpu.to('cpu')
-            torch.cuda.synchronize()
+            if adapter in self.boft_R_cpu.keys():
+                self.boft_R[adapter] = self.boft_R_cpu[adapter]
+            else:
+                boft_R_cpu = boft_R_gpu.to('cpu', non_blocking=True)
+                self.boft_R[adapter] = boft_R_cpu 
+                self.boft_R_cpu[adapter] = boft_R_cpu
             del boft_R_gpu
             torch.cuda.empty_cache()
             # print("boft_R moved to cpu:", self.boft_R[adapter].device)
@@ -392,7 +399,8 @@ class BOFTLayer(BaseTunerLayer):
         if not self.boft_R[adapter].is_cuda:
             boft_R_cpu = self.boft_R[adapter]
             if self.base_layer.weight.is_cuda:
-                boft_R_gpu = boft_R_cpu.to(self.base_layer.weight.device)
+                boft_R_gpu = boft_R_cpu.to(dtype=self.base_layer.weight.dtype,
+                                           device=self.base_layer.weight.device)
                 torch.cuda.synchronize()
                 self.boft_R[adapter] = boft_R_gpu
                 del boft_R_cpu
@@ -451,7 +459,8 @@ class BOFTLayer(BaseTunerLayer):
             boft_p_cpu = self.boft_P
             if self.base_layer.weight.is_cuda:
                 # print("base layer device: ", self.base_layer.weight.device)
-                self.boft_P = self.boft_P.to(self.base_layer.weight.device)
+                self.boft_P = self.boft_P.to(dtype=self.base_layer.weight.dtype,
+                                             device=self.base_layer.weight.device)
                 torch.cuda.synchronize()
                 # print(f"moved p to gpu: {self.boft_P.device}")
             else:
@@ -547,7 +556,9 @@ class BOFTLayer(BaseTunerLayer):
         id_mat = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
 
         # Perform the Cayley parametrization
-        Q = torch.linalg.solve(id_mat + skew_mat, id_mat - skew_mat, left=False)
+        Q = torch.linalg.solve(
+                id_mat + skew_mat, id_mat - skew_mat, left=False
+                ).to(dtype=data.dtype)
 
         return Q
 
@@ -821,12 +832,13 @@ class Linear(nn.Module, BOFTLayer):
 
                             N, D, H, _ = boft_R.shape
 
-                            # get the layout for this adapter's factors
-                            n_factors = N
-                            sub_block_size = int(H//2)
-                            layout = self.create_block_diag_layout(2, D, n_factors)
-                            # print(f"base_layout: {layout.shape} {layout}\n\t")
-                            batched_adapters_layout_lst.append(layout.unsqueeze(1))
+                            # get the layout for this adapter's factors (only need 1)
+                            if (len(batched_adapters_layout_lst) == 0):
+                                n_factors = N
+                                sub_block_size = int(H//2)
+                                layout = self.create_block_diag_layout(2, D, n_factors)
+                                # print(f"base_layout: {layout.shape} {layout}\n\t")
+                                batched_adapters_layout_lst.append(layout.unsqueeze(1))
 
                             # turn boft_R into butterfly structure
                             boft_R = boft_R.view(N * D, H, H)
@@ -863,9 +875,9 @@ class Linear(nn.Module, BOFTLayer):
                             butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
 
                             batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1).to('cpu')) # factor * 1 (batch) * m * n
-                            unload_cuda_module()
 
 
+                    unload_cuda_module()
                     # create a unified layout for all adapters
                     stacked_layouts = torch.cat(batched_adapters_layout_lst, dim=1)
                     # print(f"boft batching: batched layouts shape: {stacked_layouts.shape}") # factors * batch * m * n
