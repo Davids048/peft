@@ -822,13 +822,10 @@ class Linear(nn.Module, BOFTLayer):
                             raise KeyError(f"adapter {adapter} not found in available adapters")
                         else: 
                             self.move_boft_R_to_gpu(adapter=adapter)
-                            # print(f"boft_R {self.boft_R[adapter].device}")
                             self.move_boft_p_to_gpu()
-                            # print(f"boft_p {self.boft_P.device}")
                             self.batched_adapters.append(adapter)
                             # perform preprocessing for each adapter
                             boft_R = self.boft_R[adapter]
-                            dropout = self.boft_dropout[adapter]
 
                             N, D, H, _ = boft_R.shape
 
@@ -837,14 +834,12 @@ class Linear(nn.Module, BOFTLayer):
                                 n_factors = N
                                 sub_block_size = int(H//2)
                                 layout = self.create_block_diag_layout(2, D, n_factors)
-                                # print(f"base_layout: {layout.shape} {layout}\n\t")
                                 batched_adapters_layout_lst.append(layout.unsqueeze(1))
 
                             # turn boft_R into butterfly structure
                             boft_R = boft_R.view(N * D, H, H)
                             orth_rotate_butterfly = self.cayley_batch(boft_R)
                             orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-                            # orth_rotate_butterfly = dropout(orth_rotate_butterfly) # TODO: get rid of dropout for consistency
 
 
                             # move each single adapter out of cuda
