@@ -338,42 +338,38 @@ class BOFTModel(BaseTuner):
         batch the boft_R part of each adapter layer of the input adapters
         """
         print("BOFT: batch_adapters")
-        streams = []  # List to hold the streams
-        operations = []  # List to hold the operations to be executed in each stream
-
-        # Define the operation to be done in this stream
-        def process_module(module, adapter_lst, stream):
-            with torch.cuda.stream(stream):
-                if module.merged:
-                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
-                    module.unmerge()
-                module.batch_adapters(adapter_lst)
-
+        import multiprocessing
+        multiprocessing.set_start_method("spawn", force=True)
+        from concurrent.futures import ThreadPoolExecutor 
+        # Prepare data for multiprocessing
+        # We pass the module and adapter_lst as a tuple to the worker function
+        modules_to_process = []
         for module in self.model.modules():
             if isinstance(module, BOFTLayer):
-                # Create a new stream for each BOFTLayer
-                stream = torch.cuda.Stream()
-                streams.append(stream)
+                modules_to_process.append((module, adapter_lst))
+        # Create a pool of processes and map the processing function to the data
+        with multiprocessing.Pool(processes=2) as pool:
+            result_modules = pool.map(self.process_module, modules_to_process)
+            print("result modules: ", len(result_modules))
 
-                
+        updated_count = 0
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                state = result_modules[updated_count]
+                boft_R, boft_s, op_lst = state
+                print("results", boft_R.shape, boft_s.shape, len(op_lst))
+                module.boft_R["batched_adapter"] = boft_R
+                module.boft_s["batched_adapter"] = boft_s
+                module.batch_op["batched_adapter"] = op_lst
+                module.set_adapter("batched_adapter")
+                updated_count += 1
 
-                # Append the operation with its specific stream and module
-                operations.append((module, adapter_lst, stream))
-
-        # Execute all operations in their respective streams
-        for module, adapter_lst, stream in operations:
-            process_module(module, adapter_lst, stream)
-
-        # Synchronize all streams to ensure all operations are completed
-        torch.cuda.synchronize()
-
-        # print("BOFT: batch_adapters")
-        # for module in self.model.modules():
-        #     if isinstance(module, BOFTLayer):
-        #         if module.merged:
-        #             warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
-        #             module.unmerge()
-        #         module.batch_adapters(adapter_lst)
+    def process_module(self, module_info):
+            module, adapter_lst = module_info
+            if module.merged:
+                warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                module.unmerge()
+            return module.batch_adapters(adapter_lst)
 
     def unbatch_adapters(self, adapter_lst):
         """
