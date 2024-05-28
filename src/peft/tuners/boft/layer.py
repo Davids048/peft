@@ -595,6 +595,9 @@ class Linear(nn.Module, BOFTLayer):
         self.batch_layout = {}
         self.batched_adapters = [] # stores the name of the currently batched adapters
 
+        # cuda graph vars
+        self.forward_mode = "regular"
+
         # Attempt to load the CUDA extension during model initialization
         if not get_fbd_cuda():
             self.fbd_cuda_available = False
@@ -905,7 +908,8 @@ class Linear(nn.Module, BOFTLayer):
                     sub_block_size = int(H//2) 
                     # print(f"sub_block_size: {sub_block_size}")
                     for i in range(n_factors):
-                        batch_op = triton.ops.blocksparse.matmul(stacked_layouts[i], sub_block_size, "dds", device=self.base_layer.weight.device)
+                        # only use the first layout (triton only needs 1 unified layout)
+                        batch_op = triton.ops.blocksparse.matmul(batched_adapters_layout_lst[0][i], sub_block_size, "dds", device=self.base_layer.weight.device)
                         ops_lst.append(batch_op)
                     # Create a triton op based on layout
                     self.batch_op["batched_adapter"] = ops_lst
@@ -997,48 +1001,75 @@ class Linear(nn.Module, BOFTLayer):
         layout = layout.to(torch.int)
         return layout
     
-    @profile
+    @torch.no_grad
     def get_batched_activation(self, x: torch.Tensor, *args, **kwargs):
         """
         Use the batched adapter and compiled triton op, calculate the 
         """
         previous_type = x.dtype
-        with torch.no_grad():
+        if self.forward_mode == "capture":
+            # capture a cuda graph
+            print("in capture mode")
+            print("x shape", x.shape)
+            self.static_input  = torch.rand_like(x, device=x.device)
+            self.graph = torch.cuda.CUDAGraph()
+            self.static_input = self.static_input * self.boft_s["batched_adapter"]
+            # record the part using triton
+            with torch.cuda.device(x.device):
+                with torch.cuda.graph(self.graph):
+                    # transform result to 4d on the 2nd dim (1st is for factors)
+                    self.static_input = self.static_input.unsqueeze(0)
+
+                    # process base_weight * boft weight
+                    boft_R = self.boft_R["batched_adapter"]
+                    op_lst = self.batch_op["batched_adapter"]
+
+                    # use triton op (created for each factor, to multiply the weights)
+                    for i in range(len(op_lst)):
+                        op = op_lst[i]
+                        op(self.static_input, boft_R[i:i+1, :,:,:],self.static_input)
+
+                    self.static_input = self.static_input.squeeze(0)
+                    self.static_input = self.static_input.to(self.get_base_layer().weight.data.dtype)
+
+                self.static_input =  self.base_layer(self.static_input, *args, **kwargs)  
+                self.static_input = self.static_input.to(previous_type)
+                return self.static_input
+        elif self.forward_mode == "use_graph":
+            self.static_input.copy_(x)
+            self.static_input = self.static_input * self.boft_s["batched_adapter"]
+            self.graph.replay()
+            print("using cuda graph")
+            self.static_input =  self.base_layer(self.static_input, *args, **kwargs)  
+            self.static_input = self.static_input.to(previous_type)
+            return self.static_input
+        elif self.forward_mode in ["regular", "warm_up"]:
+            print("in regular inference mode")
+            previous_type = x.dtype
             with torch.cuda.device(x.device):
                 result = x
                 # process result * scale up
-                # print(f"batch activation: result: shape: {result.shape}, {self.boft_s['batched_adapter'].shape}")
                 result = result * self.boft_s["batched_adapter"]
-                # print(f"result shape: {result.shape}")
-
                 # transform result to 4d on the 2nd dim (1st is for factors)
                 result = result.unsqueeze(0)
-
                 # process base_weight * boft weight
                 boft_R = self.boft_R["batched_adapter"]
-                # print(f"batch activation: boft_R shape: {boft_R.shape}")
                 op_lst = self.batch_op["batched_adapter"]
 
                 # use triton op (created for each factor, to multiply the weights)
-                with record_function("get_res_using_triton_op"):
-                    for i in range(len(op_lst)):
-                        op = op_lst[i]
-                        # print(f"factor {i}, result: {result.shape}, boft factor: {boft_R[i:i+1, :,:,:].shape}")
-                        # result = op(result, boft_R[i:i+1, :,:,:],result)
-                        op(result, boft_R[i:i+1, :,:,:],result)
-                    # print(f"batch activation: rotated weight: shape: {result.shape}")
-
-
+                for i in range(len(op_lst)):
+                    op = op_lst[i]
+                    op(result, boft_R[i:i+1, :,:,:],result)
 
                 # tranform to fit forward pass
-                with record_function("final_get_base_layer"):
-                    result = result.squeeze(0)
-                    result = result.to(self.get_base_layer().weight.data.dtype)
-                    result =  self.base_layer(result, *args, **kwargs)  
-
-
+                result = result.squeeze(0)
+                result = result.to(self.get_base_layer().weight.data.dtype)
+                result =  self.base_layer(result, *args, **kwargs)  
                 result = result.to(previous_type)
                 return result
+
+    def set_forward_mode(self, mode):
+        self.forward_mode = mode
         
 
 

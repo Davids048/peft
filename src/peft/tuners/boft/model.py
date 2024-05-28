@@ -393,3 +393,11 @@ class BOFTModel(BaseTuner):
                         module.move_boft_R_to_cpu(adapter)
                         module.move_boft_s_to_cpu(adapter)
                         module.move_boft_p_to_cpu()
+                torch.cuda.synchronize(module.base_layer.weight.device)
+    
+    def set_forward_mode(self, mode):
+        if mode not in ["capture", "warm_up", "use_graph", "regular"]:
+            raise Exception("mode is not defined", mode)
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                module.set_forward_mode(mode)

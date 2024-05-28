@@ -1041,7 +1041,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self.add_adapter("batched_adapter", config)
         if isinstance(self.base_model, BOFTModel):
             self.base_model.move_all_boft_r_s_to_cpu() # clear out memory 
-
+            print("finished move boft weights to cpu")
         # batch adapters
         self.base_model.batch_adapters(adapter_lst)
         print("model finished batching")
