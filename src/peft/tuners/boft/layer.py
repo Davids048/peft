@@ -597,6 +597,8 @@ class Linear(nn.Module, BOFTLayer):
 
         # cuda graph vars
         self.forward_mode = "regular"
+        self.graph = {}
+        self.static_input = {}
 
         # Attempt to load the CUDA extension during model initialization
         if not get_fbd_cuda():
@@ -839,7 +841,6 @@ class Linear(nn.Module, BOFTLayer):
                             N, D, H, _ = boft_R.shape
 
                             # get the layout for this adapter's factors (need all )
-                            # if (len(batched_adapters_layout_lst) == 0):
                             n_factors = N
                             sub_block_size = int(H//2)
                             layout = self.create_block_diag_layout(2, D, n_factors)
@@ -1010,15 +1011,15 @@ class Linear(nn.Module, BOFTLayer):
         if self.forward_mode == "capture":
             # capture a cuda graph
             print("in capture mode")
-            print("x shape", x.shape)
-            self.static_input  = torch.rand_like(x, device=x.device)
-            self.graph = torch.cuda.CUDAGraph()
-            self.static_input = self.static_input * self.boft_s["batched_adapter"]
+            key = x.shape
+            self.static_input[key]  = torch.rand_like(x, device=x.device)
+            self.graph[key] = torch.cuda.CUDAGraph()
+            self.static_input[key] = self.static_input[key] * self.boft_s["batched_adapter"]
             # record the part using triton
             with torch.cuda.device(x.device):
-                with torch.cuda.graph(self.graph):
+                with torch.cuda.graph(self.graph[key]):
                     # transform result to 4d on the 2nd dim (1st is for factors)
-                    self.static_input = self.static_input.unsqueeze(0)
+                    self.static_input[key] = self.static_input[key].unsqueeze(0)
 
                     # process base_weight * boft weight
                     boft_R = self.boft_R["batched_adapter"]
@@ -1027,24 +1028,25 @@ class Linear(nn.Module, BOFTLayer):
                     # use triton op (created for each factor, to multiply the weights)
                     for i in range(len(op_lst)):
                         op = op_lst[i]
-                        op(self.static_input, boft_R[i:i+1, :,:,:],self.static_input)
+                        op(self.static_input[key], boft_R[i:i+1, :,:,:],self.static_input[key])
 
-                    self.static_input = self.static_input.squeeze(0)
-                    self.static_input = self.static_input.to(self.get_base_layer().weight.data.dtype)
+                    self.static_input[key] = self.static_input[key].squeeze(0)
+                    self.static_input[key] = self.static_input[key].to(self.get_base_layer().weight.data.dtype)
 
-                self.static_input =  self.base_layer(self.static_input, *args, **kwargs)  
-                self.static_input = self.static_input.to(previous_type)
-                return self.static_input
+                self.static_input[key] =  self.base_layer(self.static_input[key], *args, **kwargs)  
+                self.static_input[key] = self.static_input[key].to(previous_type)
+                return self.static_input[key]
         elif self.forward_mode == "use_graph":
-            self.static_input.copy_(x)
-            self.static_input = self.static_input * self.boft_s["batched_adapter"]
-            self.graph.replay()
-            print("using cuda graph")
-            self.static_input =  self.base_layer(self.static_input, *args, **kwargs)  
-            self.static_input = self.static_input.to(previous_type)
-            return self.static_input
+            key = x.shape
+            self.static_input[key].copy_(x)
+            self.static_input[key] = self.static_input[key] * self.boft_s["batched_adapter"]
+            self.graph[key].replay()
+            # print("using cuda graph")
+            self.static_input[key] =  self.base_layer(self.static_input[key], *args, **kwargs)  
+            self.static_input[key] = self.static_input[key].to(previous_type)
+            return self.static_input[key]
         elif self.forward_mode in ["regular", "warm_up"]:
-            print("in regular inference mode")
+            # print("in regular inference mode")
             previous_type = x.dtype
             with torch.cuda.device(x.device):
                 result = x
