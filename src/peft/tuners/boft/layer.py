@@ -34,6 +34,7 @@ import os
 
 import triton
 import triton.ops
+from triton.ops.blocksparse import matmul
 import gc
 
 # For profiling
@@ -597,8 +598,8 @@ class Linear(nn.Module, BOFTLayer):
 
         # cuda graph vars
         self.forward_mode = "regular"
-        self.graph = {}
-        self.static_input = {}
+        self.graph = None
+        self.static_weight = None
 
         # Attempt to load the CUDA extension during model initialization
         if not get_fbd_cuda():
@@ -919,6 +920,117 @@ class Linear(nn.Module, BOFTLayer):
                     self.set_adapter("batched_adapter")
         self.move_boft_p_to_cpu()
         return (self.boft_R["batched_adapter"], self.boft_s["batched_adapter"], self.batch_op["batched_adapter"])
+    
+    def get_full_boft_R(self, adapter):
+        """
+        Given the adapter, create the adapter's boft_R in the full format
+        """
+        if adapter not in self.boft_R.keys():
+            raise KeyError(f"adapter {adapter} not found in available adapters")
+        else: 
+            self.move_boft_R_to_gpu(adapter=adapter)
+            self.move_boft_p_to_gpu()
+            self.move_boft_s_to_gpu(adapter=adapter)
+            self.batched_adapters.append(adapter)
+            # perform preprocessing for each adapter
+            boft_R = self.boft_R[adapter]
+            boft_s = self.boft_s[adapter]
+
+            N, D, H, _ = boft_R.shape
+            # turn boft_R into butterfly structure
+            boft_R = boft_R.view(N * D, H, H)
+            orth_rotate_butterfly = self.cayley_batch(boft_R)
+            orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
+
+
+            # move each single adapter out of cuda
+            self.move_boft_R_to_cpu(adapter)
+            self.move_boft_s_to_cpu(adapter)
+            torch.cuda.synchronize(self.base_layer.weight.device)
+            
+            block_diagonal_butterfly_lst = []
+            for i in range(orth_rotate_butterfly.shape[0]):
+                block_diagonal_butterfly = torch.block_diag(
+                    *torch.unbind(orth_rotate_butterfly[i])
+                )
+                block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
+                block_diagonal_butterfly_lst.append(block_diagonal_butterfly)
+            block_diagonal_butterfly = torch.cat(block_diagonal_butterfly_lst, dim=0)
+
+
+            torch.cuda.synchronize(self.base_layer.weight.device)
+            butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
+            butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
+            return butterfly_oft_mat_batch
+    
+    def get_boft_R_layout(self, adapter):
+        if adapter not in self.boft_R.keys():
+            raise KeyError(f"adapter {adapter} not found in available adapters")
+        else: 
+            N, D, H, _ = self.boft_R[adapter].shape
+            # get the layout for this adapter's factors (need all )
+            n_factors = N
+            layout = self.create_block_diag_layout(2, D, n_factors)
+            return layout.unsqueeze(1)
+
+    
+    def create_dummy_batched_adapters(self, adapter_lst):
+        """
+        Create a batched adapter w/ len(adapter_lst) number of adapters. Each is 
+        a clone of the 1st adapter that is initially loaded to the model
+        """
+        print("BOFT creating dummy batched adapter")
+        print(adapter_lst)
+        with torch.cuda.device(self.base_layer.weight.device):
+            assert self.boft_R # There must be at least 1 adapter in the model
+
+            for adapter in self.active_adapters:
+                full_boft_R = self.get_full_boft_R(adapter=adapter) # n_factors, full_side, full_side
+                layout = self.get_boft_R_layout(adapter=adapter)
+                self.move_boft_s_to_gpu(adapter)
+                boft_s = self.boft_s[adapter]
+                n_factors, n_blocks, block_size ,_ = self.boft_R[adapter].shape
+                sub_block_size = int(block_size//2)
+
+                # sparsify this weight
+                each_step_factors_shape = [1, 1, full_boft_R.shape[1], full_boft_R.shape[2]]
+                factors_by_step_lst = []
+                for i in range(n_factors):
+                    cur_step_factors = self.sparsify_tensor(full_boft_R[i].view(each_step_factors_shape), # 1, 1, full_side, full_side
+                                            mask=layout[i],
+                                            block=int(block_size//2))
+                    factors_by_step_lst.append(cur_step_factors)
+                sparse_boft_R = torch.cat(factors_by_step_lst, dim=0) # n_factors, 1 adapter, m, n
+                break
+            unload_cuda_module()
+
+            # stack adapters together
+            sparse_boft_R_lst = [sparse_boft_R for _ in range(len(adapter_lst))]
+            sparse_batched_boft_R = torch.cat(sparse_boft_R_lst, dim=1).to(device=self.base_layer.weight.device) # n_factors, n_adapters, m, n
+            print(f"stacked_full adapters: {sparse_batched_boft_R.shape}") # factor * batch * m * n 
+            self.boft_R["batched_adapter"] = sparse_batched_boft_R.to(device=self.base_layer.weight.device)
+
+          
+            # stack boft_s
+            batched_boft_s = [boft_s for _ in range(len(adapter_lst))]
+            self.boft_s["batched_adapter"] = torch.stack(batched_boft_s, dim=0).permute(0,2,1).to(device=self.base_layer.weight.device)
+
+            # compile ops
+            ops_lst = []
+            for i in range(n_factors):
+                # only use the first layout (triton only needs 1 unified layout)
+                batch_op = triton.ops.blocksparse.matmul(layout[i], sub_block_size, "dds", device=self.base_layer.weight.device)
+                ops_lst.append(batch_op)
+            self.batch_op["batched_adapter"] = ops_lst
+
+            self.set_adapter("batched_adapter")
+        self.move_boft_p_to_cpu()
+        return (self.boft_R["batched_adapter"], self.boft_s["batched_adapter"], self.batch_op["batched_adapter"])
+            
+
+
+
+
 
     def unbatch_adapters(self, adapter_lst):
         """
