@@ -1119,71 +1119,94 @@ class Linear(nn.Module, BOFTLayer):
         """
         Use the batched adapter and compiled triton op, calculate the 
         """
-        previous_type = x.dtype
         if self.forward_mode == "capture":
             # capture a cuda graph
             print("in capture mode")
-            key = x.shape
-            self.static_input[key]  = torch.rand_like(x, device=x.device)
-            self.graph[key] = torch.cuda.CUDAGraph()
-            self.static_input[key] = self.static_input[key] * self.boft_s["batched_adapter"]
+            # set up graph
+            graph = torch.cuda.CUDAGraph()
+            graph.enable_debug_mode()
+            graph.debug_dump("./graph_debug.dot")
+            self.graph = graph
+            self.static_weight = torch.rand_like(self.boft_s["batched_adapter"], device=x.device)
             # record the part using triton
             with torch.cuda.device(x.device):
-                with torch.cuda.graph(self.graph[key]):
-                    # transform result to 4d on the 2nd dim (1st is for factors)
-                    self.static_input[key] = self.static_input[key].unsqueeze(0)
+                with torch.cuda.graph(self.graph):
+                    self.static_weight = self.batched_triton_activation(self.static_weight)
 
-                    # process base_weight * boft weight
-                    boft_R = self.boft_R["batched_adapter"]
-                    op_lst = self.batch_op["batched_adapter"]
+                result = x * self.static_weight
 
-                    # use triton op (created for each factor, to multiply the weights)
-                    for i in range(len(op_lst)):
-                        op = op_lst[i]
-                        op(self.static_input[key], boft_R[i:i+1, :,:,:],self.static_input[key])
-
-                    self.static_input[key] = self.static_input[key].squeeze(0)
-                    self.static_input[key] = self.static_input[key].to(self.get_base_layer().weight.data.dtype)
-
-                self.static_input[key] =  self.base_layer(self.static_input[key], *args, **kwargs)  
-                self.static_input[key] = self.static_input[key].to(previous_type)
-                return self.static_input[key]
+                result = self.base_layer(result, *args, **kwargs)
+                result = result.to(x.dtype)
+                return result
+                    
         elif self.forward_mode == "use_graph":
-            key = x.shape
-            self.static_input[key].copy_(x)
-            self.static_input[key] = self.static_input[key] * self.boft_s["batched_adapter"]
-            self.graph[key].replay()
+            if self.static_weight is None:
+                raise Exception("Static weight is not initialized. Was graph captured?")
+            self.static_weight.copy_(self.boft_s["batched_adapter"])
+            self.graph.replay()
+            torch.cuda.current_stream(device=x.device).synchronize()
             # print("using cuda graph")
-            self.static_input[key] =  self.base_layer(self.static_input[key], *args, **kwargs)  
-            self.static_input[key] = self.static_input[key].to(previous_type)
-            return self.static_input[key]
+            result = x * self.static_weight
+            result = self.base_layer(result, *args, **kwargs)
+            result = result.to(x.dtype)
+            return result
         elif self.forward_mode in ["regular", "warm_up"]:
             # print("in regular inference mode")
-            previous_type = x.dtype
             with torch.cuda.device(x.device):
-                result = x
-                # process result * scale up
-                result = result * self.boft_s["batched_adapter"]
-                # transform result to 4d on the 2nd dim (1st is for factors)
-                result = result.unsqueeze(0)
-                # process base_weight * boft weight
-                boft_R = self.boft_R["batched_adapter"]
-                op_lst = self.batch_op["batched_adapter"]
+                static_weight = self.boft_s["batched_adapter"].clone().detach()
+                static_weight = self.batched_triton_activation(static_weight)
+            
+                result = x * static_weight
 
-                # use triton op (created for each factor, to multiply the weights)
-                for i in range(len(op_lst)):
-                    op = op_lst[i]
-                    op(result, boft_R[i:i+1, :,:,:],result)
-
-                # tranform to fit forward pass
-                result = result.squeeze(0)
-                result = result.to(self.get_base_layer().weight.data.dtype)
-                result =  self.base_layer(result, *args, **kwargs)  
-                result = result.to(previous_type)
+                result = self.base_layer(result, *args, **kwargs)
+                result = result.to(x.dtype)
                 return result
+
+    def batched_triton_activation(self, static_weight):
+        # S^T
+        static_weight = self.boft_s["batched_adapter"].clone().detach()
+        # prepare
+        boft_R = self.boft_R["batched_adapter"]
+        op_lst = self.batch_op["batched_adapter"]
+        static_weight = static_weight.unsqueeze(0)
+        # S^T x B1 x B2 ... x Bn
+        for i in range(len(op_lst)):
+            op = op_lst[i]
+            op(static_weight, boft_R[i:i+1, :, :, :], static_weight)
+        static_weight = static_weight.squeeze(0)
+
+        return static_weight
+
 
     def set_forward_mode(self, mode):
         self.forward_mode = mode
+    
+    def move_batch_op(self, ops, device):
+        """
+        Move a list of triton matmul ops to the input device, 
+        return a copy of the ops for the target device
+        Args:
+            ops (`List[triton.ops.blocksparse.matmul]`):
+                a list of triton matmul objs
+            device (`torch.device`):
+                the target device
+        """
+        ret_ops = []
+        assert isinstance(device, torch.device)
+        for i in range(len(ops)):
+            op = ops[i]
+            if isinstance(op, matmul):
+                new_op = matmul(op.layout.to(device), 
+                                op.block, 
+                                op.mode, 
+                                device, 
+                                op.trans_a, 
+                                op.trans_b, 
+                                op.trans_c)
+                ret_ops.append(new_op)
+        return ret_ops
+
+
         
 
 
