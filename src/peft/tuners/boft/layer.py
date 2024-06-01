@@ -211,6 +211,7 @@ class BOFTLayer(BaseTunerLayer):
 
         # fields for batched ops
         self.boft_R_cpu = nn.ParameterDict({})
+        self.boft_P_dict = {} # key: (n_factor, n_blocks, block_size), value: boft_P
 
         base_layer = self.get_base_layer()
 
@@ -328,31 +329,14 @@ class BOFTLayer(BaseTunerLayer):
                 boft_block_size != self.boft_block_size[curr_adapter] or \
                 boft_n_butterfly_factor != self.n_butterfly_factors[curr_adapter]:
                 # P is different, we need to calculate.
-                P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
-                for i in range(boft_n_butterfly_factor + 1):
-                    perm = self.block_butterfly_perm(
-                        self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
-                    )
-                    perm_mat = self.perm2mat(perm)
-                    P[i] = perm_mat
-                    # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
-                self.register_buffer("boft_P", P)
-                # print("registerd boft_P")
+                self.create_boft_P(boft_n_butterfly_factor, boft_block_num, boft_block_size)
             else:
                 # print("boft_P does not need update")
                 pass
         else:
-            # P is different, we need to calculate.
-            P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
-            for i in range(boft_n_butterfly_factor + 1):
-                perm = self.block_butterfly_perm(
-                    self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
-                )
-                perm_mat = self.perm2mat(perm)
-                P[i] = perm_mat
-                # print(f"\t\tblock_but_perm: finished: mat shape: {perm_mat.shape}")
+            # First time creating boft_P
+            P = self.create_boft_P(boft_n_butterfly_factor, boft_block_num, boft_block_size)
             self.register_buffer("boft_P", P)
-            # print("registerd first boft_P")
 
 
 
@@ -376,6 +360,24 @@ class BOFTLayer(BaseTunerLayer):
         self.boft_block_num[adapter_name] = boft_block_num
         self.n_butterfly_factors[adapter_name] = boft_n_butterfly_factor
         self.set_adapter(self.active_adapters)
+
+        # move to cpu to prevent out of memory error when there are a lot of adapters loaded
+        # self.move_boft_R_to_cpu(adapter_name)
+        # self.move_boft_s_to_cpu(adapter_name)
+        # # self.move_boft_p_to_cpu()
+
+
+    def create_boft_P(self, boft_n_butterfly_factor, boft_block_num, boft_block_size):
+        # P is different, we need to calculate.
+        P = torch.empty((boft_n_butterfly_factor + 1, self.in_features, self.in_features))
+        for i in range(boft_n_butterfly_factor + 1):
+            perm = self.block_butterfly_perm(
+                self.in_features, int(boft_block_num / (2 ** (i))), int(boft_block_size / 2), boft_n_butterfly_factor
+            )
+            perm_mat = self.perm2mat(perm)
+            P[i] = perm_mat
+        self.boft_P_dict[(boft_n_butterfly_factor, boft_block_num, boft_block_size)] = P
+        return P
 
     def move_boft_R_to_cpu(self, adapter):
         if self.boft_R[adapter].is_cuda:
@@ -441,17 +443,20 @@ class BOFTLayer(BaseTunerLayer):
         when updating layers, all the boft_P... etc matrices are moved to GPU,
         this is very costly, as that is a big matrix (e.g. in llama2, each 
         boft_P is 4096 * 4096). 
+
+        Move all boft_P in boft_P_dict (not just self. boft_P) to CPU
         """
-        # print(f"\nboft before clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
-        if self.boft_P.is_cuda:
-            boft_P_gpu = self.boft_P 
-            # print(f"boft_P: {boft_P_gpu.device}")
-            boft_P_cpu = boft_P_gpu.to('cpu', non_blocking=True)
-            # torch.cuda.synchronize()
-            self.boft_P = boft_P_cpu
-            del boft_P_gpu
-            torch.cuda.empty_cache()
-            # print("moved boft_P to cpu")
+        if self.boft_P_dict:
+            for key, boft_P in self.boft_P_dict.items():
+                if boft_P.is_cuda:
+                    boft_P_gpu = boft_P 
+                    # print(f"boft_P: {boft_P_gpu.device}")
+                    boft_P_cpu = boft_P_gpu.to('cpu', non_blocking=True)
+                    # torch.cuda.synchronize()
+                    self.boft_P_dict[key] = boft_P_cpu
+                    del boft_P_gpu
+                    torch.cuda.empty_cache()
+                    # print("moved boft_P to cpu")
 
         # print(f"boft after  clear p mem: {torch.cuda.memory_allocated(self.base_layer.weight.device)}")
     
@@ -468,6 +473,33 @@ class BOFTLayer(BaseTunerLayer):
                 raise RuntimeError(f"base weight is on {self.base_layer.weight.device}- CUDA device error")
         # else:
         #     print("boft_P is on GPU already")
+    
+    def permute_butterfly_factors(self, diag_factors, adapter_name):
+        """
+        Given the adapter name, and the calculated factors in dxd full format,
+        Calculate the permutation of the factors so they emit the butterfly 
+        structures. 
+        """
+        key = (self.n_butterfly_factors[adapter_name], 
+               self.boft_block_num[adapter_name],
+               self.boft_block_size[adapter_name])
+        if key not in self.boft_P_dict.keys():
+            raise Exception(f"Boft_P is not found for adapter: {adapter_name}"
+                            f"with key: {key}")
+        else:
+            boft_P = self.boft_P_dict[key]
+            if not boft_P.is_cuda:
+                # move boft_P to GPU:
+                boft_P = boft_P.to(device=self.base_layer.weight.device,
+                                   dtype=self.base_layer.weight.dtype)
+            # calculate
+            diag_factors = torch.bmm(diag_factors, boft_P.permute(0, 2, 1))
+            diag_factors = torch.bmm(boft_P, diag_factors)
+
+            # move boft_P to CPU 
+            self.boft_P_dict[key] = boft_P.to(device='cpu', non_blocking=True)
+            return diag_factors
+
 
     def reset_boft_parameters(self, adapter_name, init_weights):
         """
@@ -595,6 +627,7 @@ class Linear(nn.Module, BOFTLayer):
         self.batch_op = {} 
         self.batch_layout = {}
         self.batched_adapters = [] # stores the name of the currently batched adapters
+        self.sub_block_size = 16 # all blocks will be re-sparsified to blocks of size 16 for unified layout
 
         # cuda graph vars
         self.forward_mode = "regular"
@@ -820,107 +853,45 @@ class Linear(nn.Module, BOFTLayer):
                     continue
                 else:
                     # processing boft_R 
-                    batched_adapters_lst = []
+                    sparse_boft_R_lst = []
                     batched_adapters_layout_lst = []
                     batched_boft_s = []
                     block_size = 0
 
                     for adapter in adapter_lst:
-                        if adapter not in self.boft_R.keys():
-                            raise KeyError(f"adapter {adapter} not found in available adapters")
-                        else: 
-                            self.move_boft_R_to_gpu(adapter=adapter)
-                            self.move_boft_p_to_gpu()
-                            self.move_boft_s_to_gpu(adapter=adapter)
-                            self.batched_adapters.append(adapter)
-                            # perform preprocessing for each adapter
-                            boft_R = self.boft_R[adapter]
-                            boft_s = self.boft_s[adapter]
-                            batched_boft_s.append(boft_s)
-                            
+                        sparse_boft_R, boft_s, layout = self.get_sparse_weights_and_layout(adapter)
+                        sparse_boft_R_lst.append(sparse_boft_R)
+                        batched_boft_s.append(boft_s)
+                        batched_adapters_layout_lst.append(layout)
 
-                            N, D, H, _ = boft_R.shape
-
-                            # get the layout for this adapter's factors (need all )
-                            n_factors = N
-                            sub_block_size = int(H//2)
-                            layout = self.create_block_diag_layout(2, D, n_factors)
-                            batched_adapters_layout_lst.append(layout.unsqueeze(1))
-
-                            # turn boft_R into butterfly structure
-                            boft_R = boft_R.view(N * D, H, H)
-                            orth_rotate_butterfly = self.cayley_batch(boft_R)
-                            orth_rotate_butterfly = orth_rotate_butterfly.view(N, D, H, H)
-
-
-                            # move each single adapter out of cuda
-                            self.move_boft_R_to_cpu(adapter)
-                            self.move_boft_s_to_cpu(adapter)
-                            torch.cuda.synchronize(self.base_layer.weight.device)
-
-                            # if self.fbd_cuda_available:
-                            #     block_diagonal_butterfly = FastBlockDiag.apply(orth_rotate_butterfly)
-                            #     torch.cuda.synchronize()
-                            #     print(f"fbd_cuda available block_diagonal_butterfly, {block_diagonal_butterfly.shape}")
-                            # else:
-                            #     orth_rotate_butterfly = orth_rotate_butterfly.squeeze(0)
-                            #     block_diagonal_butterfly = torch.block_diag(*torch.unbind(orth_rotate_butterfly))
-                            #     block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
-                            
-                            block_diagonal_butterfly_lst = []
-                            for i in range(orth_rotate_butterfly.shape[0]):
-                                block_diagonal_butterfly = torch.block_diag(
-                                    *torch.unbind(orth_rotate_butterfly[i])
-                                )
-                                block_diagonal_butterfly = block_diagonal_butterfly.unsqueeze(0)
-                                block_diagonal_butterfly_lst.append(block_diagonal_butterfly)
-                            block_diagonal_butterfly = torch.cat(block_diagonal_butterfly_lst, dim=0)
-
-
-                            torch.cuda.synchronize(self.base_layer.weight.device)
-                            butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
-                            butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
-
-                            batched_adapters_lst.append(butterfly_oft_mat_batch.unsqueeze(1).to('cpu')) # factor * 1 (batch) * m * n
-
-
+                        self.move_boft_R_to_cpu(adapter)
+                        self.move_boft_s_to_cpu(adapter)
                     unload_cuda_module()
-                    # create a unified layout for all adapters
-                    stacked_layouts = torch.cat(batched_adapters_layout_lst, dim=1)
-                    print(f"boft batching: batched layouts shape: {stacked_layouts.shape}") # factors * batch * m * n
 
-                    # Stack the adapters together
-                    stacked_adapters = torch.cat(batched_adapters_lst, dim=1).to(self.base_layer.weight.device)
-                    # print(f"stacked_full adapters: {stacked_adapters.shape}") # factor * batch * m * n 
-                    # sparsify adapters
-                    each_step_factors_shape = [1, stacked_adapters.shape[1], stacked_adapters.shape[2],stacked_adapters.shape[3]]
-                    factors_by_step_lst = []
-                    for i in range(n_factors):
-                        cur_step_factors = self.sparsify_tensor(stacked_adapters[i].view(each_step_factors_shape),
-                                                                mask=stacked_layouts[i],
-                                                                block=sub_block_size)
-                        # print("cur_step_factors",cur_step_factors.shape)
-                        factors_by_step_lst.append(cur_step_factors)
-                    sparse_stacked_adapters = torch.cat(factors_by_step_lst, dim=0)
-                    self.boft_R["batched_adapter"] = sparse_stacked_adapters
-                    self.boft_s["batched_adapter"] = torch.stack(batched_boft_s, dim=0).permute(0,2,1)
+                    # stack adapters together
+                    sparse_batched_boft_R = torch.cat(sparse_boft_R_lst, dim=1).to(device=self.base_layer.weight.device) # n_factors, n_adapters, m, n
+                    self.boft_R["batched_adapter"] = sparse_batched_boft_R.to(device=self.base_layer.weight.device)
 
+                
+                    # stack boft_s
+                    self.boft_s["batched_adapter"] = torch.stack(batched_boft_s, dim=0).permute(0,2,1).to(device=self.base_layer.weight.device)
 
+                    # stack layouts
+                    unified_layout = torch.cat(batched_adapters_layout_lst, dim=1)
+                    n_factors = unified_layout.shape[0]
+                    # compile ops
                     ops_lst = []
-                    sub_block_size = int(H//2) 
-                    # print(f"sub_block_size: {sub_block_size}")
                     for i in range(n_factors):
                         # only use the first layout (triton only needs 1 unified layout)
-                        batch_op = triton.ops.blocksparse.matmul(batched_adapters_layout_lst[0][i], sub_block_size, "dds", device=self.base_layer.weight.device)
+                        batch_op = triton.ops.blocksparse.matmul(unified_layout[i], self.sub_block_size, "dds", device=self.base_layer.weight.device)
                         ops_lst.append(batch_op)
-                    # Create a triton op based on layout
                     self.batch_op["batched_adapter"] = ops_lst
 
 
                     self.set_adapter("batched_adapter")
-        self.move_boft_p_to_cpu()
-        return (self.boft_R["batched_adapter"], self.boft_s["batched_adapter"], self.batch_op["batched_adapter"])
-    
+                self.move_boft_p_to_cpu()
+                return (self.boft_R["batched_adapter"], self.boft_s["batched_adapter"], self.batch_op["batched_adapter"])
+
     def get_full_boft_R(self, adapter):
         """
         Given the adapter, create the adapter's boft_R in the full format
@@ -928,13 +899,11 @@ class Linear(nn.Module, BOFTLayer):
         if adapter not in self.boft_R.keys():
             raise KeyError(f"adapter {adapter} not found in available adapters")
         else: 
-            self.move_boft_R_to_gpu(adapter=adapter)
+            self.move_boft_R_to_gpu(adapter)
             self.move_boft_p_to_gpu()
-            self.move_boft_s_to_gpu(adapter=adapter)
             self.batched_adapters.append(adapter)
             # perform preprocessing for each adapter
             boft_R = self.boft_R[adapter]
-            boft_s = self.boft_s[adapter]
 
             N, D, H, _ = boft_R.shape
             # turn boft_R into butterfly structure
@@ -945,7 +914,7 @@ class Linear(nn.Module, BOFTLayer):
 
             # move each single adapter out of cuda
             self.move_boft_R_to_cpu(adapter)
-            self.move_boft_s_to_cpu(adapter)
+            
             torch.cuda.synchronize(self.base_layer.weight.device)
             
             block_diagonal_butterfly_lst = []
@@ -959,8 +928,7 @@ class Linear(nn.Module, BOFTLayer):
 
 
             torch.cuda.synchronize(self.base_layer.weight.device)
-            butterfly_oft_mat_batch = torch.bmm(block_diagonal_butterfly, self.boft_P.permute(0, 2, 1))
-            butterfly_oft_mat_batch = torch.bmm(self.boft_P, butterfly_oft_mat_batch)
+            butterfly_oft_mat_batch = self.permute_butterfly_factors(block_diagonal_butterfly, adapter)
             return butterfly_oft_mat_batch
     
     def get_boft_R_layout(self, adapter):
@@ -970,8 +938,31 @@ class Linear(nn.Module, BOFTLayer):
             N, D, H, _ = self.boft_R[adapter].shape
             # get the layout for this adapter's factors (need all )
             n_factors = N
-            layout = self.create_block_diag_layout(2, D, n_factors)
+            size_ratio = int(H//self.sub_block_size)
+            layout = self.create_block_diag_layout(size_ratio, D, n_factors)
             return layout.unsqueeze(1)
+    
+    def get_sparse_weights_and_layout(self, adapter):
+        """
+        Return Sparse boft_R, boft_s, and layout (blocksize = 16)
+        """
+        full_boft_R = self.get_full_boft_R(adapter=adapter) # n_factors, full_side, full_side
+        layout = self.get_boft_R_layout(adapter=adapter)
+        self.move_boft_s_to_gpu(adapter)
+        boft_s = self.boft_s[adapter]
+        n_factors, n_blocks, block_size ,_ = self.boft_R[adapter].shape
+
+        # sparsify this weight
+        each_step_factors_shape = [1, 1, full_boft_R.shape[1], full_boft_R.shape[2]]
+        factors_by_step_lst = []
+        for i in range(n_factors):
+            cur_step_factors = self.sparsify_tensor(full_boft_R[i].view(each_step_factors_shape), # 1, 1, full_side, full_side
+                                    mask=layout[i],
+                                    block=self.sub_block_size)
+            factors_by_step_lst.append(cur_step_factors)
+        sparse_boft_R = torch.cat(factors_by_step_lst, dim=0) # n_factors, 1 adapter, m, n
+        return (sparse_boft_R, boft_s, layout)
+
 
     
     def create_dummy_batched_adapters(self, adapter_lst):
