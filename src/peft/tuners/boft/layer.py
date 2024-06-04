@@ -1151,7 +1151,7 @@ class Linear(nn.Module, BOFTLayer):
             result = x * self.static_weight
             result = self.base_layer(result, *args, **kwargs)
             result = result.to(x.dtype)
-            self.static_weight.copy_(self.boft_s["batched_adapter"], non_blocking=True)
+            self.static_weight.copy_(self.boft_s["batched_adapter"], non_blocking=True) # reset static weight to boft s
             return result
         elif self.forward_mode in ["regular", "warm_up"]:
             # print("in regular inference mode")
@@ -1166,8 +1166,7 @@ class Linear(nn.Module, BOFTLayer):
                 return result
 
     def batched_triton_activation(self, static_weight):
-        # S^T
-        static_weight = self.boft_s["batched_adapter"].clone().detach()
+        # static_weight is boft_s at first.
         # prepare
         boft_R = self.boft_R["batched_adapter"]
         op_lst = self.batch_op["batched_adapter"]
