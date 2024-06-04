@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +19,7 @@ import numpy as np
 from diffusers import StableDiffusionPipeline
 from parameterized import parameterized
 
-from peft import LoHaConfig, LoraConfig, OFTConfig, BOFTConfig, get_peft_model
+from peft import BOFTConfig, LoHaConfig, LoraConfig, OFTConfig, get_peft_model
 
 from .testing_common import ClassInstantier, PeftCommonTester
 from .testing_utils import temp_seed
@@ -75,11 +74,13 @@ CONFIG_TESTING_KWARGS = (
     {
         "text_encoder": {
             "boft_block_num": 1,
+            "boft_block_size": 0,
             "target_modules": ["k_proj", "q_proj", "v_proj", "out_proj", "fc1", "fc2"],
             "boft_dropout": 0.0,
         },
         "unet": {
             "boft_block_num": 1,
+            "boft_block_size": 0,
             "target_modules": ["proj_in", "proj_out", "to_k", "to_q", "to_v", "to_out.0", "ff.net.0.proj", "ff.net.2"],
             "boft_dropout": 0.0,
         },
@@ -102,6 +103,7 @@ class StableDiffusionModelTester(TestCase, PeftCommonTester):
     Tests that diffusers StableDiffusion model works with PEFT as expected.
 
     """
+
     transformers_class = StableDiffusionPipeline
 
     def instantiate_sd_peft(self, model_id, config_cls, config_kwargs):
@@ -142,7 +144,7 @@ class StableDiffusionModelTester(TestCase, PeftCommonTester):
                 "lora_kwargs": {"init_lora_weights": [False]},
                 "loha_kwargs": {"init_weights": [False]},
                 "oft_kwargs": {"init_weights": [False]},
-                "boft_kwargs": {"init_boft_weights": [False]},
+                "boft_kwargs": {"init_weights": [False]},
             },
         )
     )
@@ -166,7 +168,40 @@ class StableDiffusionModelTester(TestCase, PeftCommonTester):
             merged_output = np.array(model(**dummy_input).images[0]).astype(np.float32)
 
         # Images are in uint8 drange, so use large atol
-        self.assertTrue(np.allclose(peft_output, merged_output, atol=1.0))
+        assert np.allclose(peft_output, merged_output, atol=1.0)
+
+    @parameterized.expand(
+        PeftStableDiffusionTestConfigManager.get_grid_parameters(
+            {
+                "model_ids": PEFT_DIFFUSERS_SD_MODELS_TO_TEST,
+                "lora_kwargs": {"init_lora_weights": [False]},
+                "loha_kwargs": {"init_weights": [False]},
+                "oft_kwargs": {"init_weights": [False]},
+                "boft_kwargs": {"init_weights": [False]},
+            },
+        )
+    )
+    def test_merge_layers_safe_merge(self, test_name, model_id, config_cls, config_kwargs):
+        # Instantiate model & adapters
+        model = self.instantiate_sd_peft(model_id, config_cls, config_kwargs)
+
+        # Generate output for peft modified StableDiffusion
+        dummy_input = self.prepare_inputs_for_testing()
+        with temp_seed(seed=42):
+            peft_output = np.array(model(**dummy_input).images[0]).astype(np.float32)
+
+        # Merge adapter and model
+        if config_cls not in [LoHaConfig, OFTConfig]:
+            # TODO: Merging the text_encoder is leading to issues on CPU with PyTorch 2.1
+            model.text_encoder = model.text_encoder.merge_and_unload(safe_merge=True)
+        model.unet = model.unet.merge_and_unload(safe_merge=True)
+
+        # Generate output for peft merged StableDiffusion
+        with temp_seed(seed=42):
+            merged_output = np.array(model(**dummy_input).images[0]).astype(np.float32)
+
+        # Images are in uint8 drange, so use large atol
+        assert np.allclose(peft_output, merged_output, atol=1.0)
 
     @parameterized.expand(
         PeftStableDiffusionTestConfigManager.get_grid_parameters(
@@ -192,10 +227,8 @@ class StableDiffusionModelTester(TestCase, PeftCommonTester):
         model.unet.add_weighted_adapter([unet_adapter_name], [0.5], "weighted_adapter_test")
 
         # Assert that base adapters config did not change
-        self.assertTrue(
-            asdict(text_encoder_adapter_config) == asdict(model.text_encoder.peft_config[text_encoder_adapter_name])
-        )
-        self.assertTrue(asdict(unet_adapter_config) == asdict(model.unet.peft_config[unet_adapter_name]))
+        assert asdict(text_encoder_adapter_config) == asdict(model.text_encoder.peft_config[text_encoder_adapter_name])
+        assert asdict(unet_adapter_config) == asdict(model.unet.peft_config[unet_adapter_name])
 
     @parameterized.expand(
         PeftStableDiffusionTestConfigManager.get_grid_parameters(
@@ -205,7 +238,7 @@ class StableDiffusionModelTester(TestCase, PeftCommonTester):
                 "loha_kwargs": {"init_weights": [False]},
                 "lokr_kwargs": {"init_weights": [False]},
                 "oft_kwargs": {"init_weights": [False]},
-                "boft_kwargs": {"init_boft_weights": [False]},
+                "boft_kwargs": {"init_weights": [False]},
             },
         )
     )

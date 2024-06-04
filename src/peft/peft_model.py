@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,15 +20,17 @@ import os
 import warnings
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Literal, Optional, Union
 
 import packaging.version
 import torch
 import transformers
 from accelerate import dispatch_model, infer_auto_device_map
 from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_submodules
-from accelerate.utils import get_balanced_memory
+from accelerate.utils import get_balanced_memory, named_module_tensors
 from huggingface_hub import ModelCard, ModelCardData, hf_hub_download
+from safetensors import safe_open
 from safetensors.torch import save_file as safe_save_file
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import PreTrainedModel
@@ -41,7 +42,9 @@ from .config import PeftConfig
 from .tuners import (
     AdaLoraModel,
     AdaptionPromptModel,
+    BOFTModel,
     IA3Model,
+    LNTuningModel,
     LoHaModel,
     LoKrModel,
     LoraModel,
@@ -52,7 +55,9 @@ from .tuners import (
     PrefixEncoder,
     PromptEmbedding,
     PromptEncoder,
+    VeraModel,
 )
+from .tuners.tuners_utils import BaseTuner, BaseTunerLayer
 from .utils import (
     SAFETENSORS_WEIGHTS_NAME,
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
@@ -85,6 +90,8 @@ PEFT_TYPE_TO_MODEL_MAPPING = {
     PeftType.IA3: IA3Model,
     PeftType.OFT: OFTModel,
     PeftType.POLY: PolyModel,
+    PeftType.LN_TUNING: LNTuningModel,
+    PeftType.VERA: VeraModel,
 }
 
 
@@ -117,6 +124,9 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self.modules_to_save = None
         self.active_adapter = adapter_name
         self.peft_type = peft_config.peft_type
+        # These args are special PEFT arguments that users can pass. They need to be removed before passing them to
+        # forward.
+        self.special_peft_forward_args = {"adapter_names"}
 
         self._is_prompt_learning = peft_config.is_prompt_learning
         if self._is_prompt_learning:
@@ -139,7 +149,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model.config.pretraining_tp = 1
 
     @property
-    def peft_config(self) -> Dict[str, PeftConfig]:
+    def peft_config(self) -> dict[str, PeftConfig]:
         if self._is_prompt_learning:
             return self._peft_config
         return self.base_model.peft_config
@@ -155,7 +165,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         return adapters
 
     @peft_config.setter
-    def peft_config(self, value: Dict[str, PeftConfig]):
+    def peft_config(self, value: dict[str, PeftConfig]):
         if self._is_prompt_learning:
             self._peft_config = value
         else:
@@ -165,7 +175,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         self,
         save_directory: str,
         safe_serialization: bool = True,
-        selected_adapters: Optional[List[str]] = None,
+        selected_adapters: Optional[list[str]] = None,
         save_embedding_layers: Union[str, bool] = "auto",
         is_main_process: bool = True,
         **kwargs: Any,
@@ -292,7 +302,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         is_trainable: bool = False,
         config: Optional[PeftConfig] = None,
         **kwargs: Any,
-    ) -> "PeftModel":
+    ) -> PeftModel:
         r"""
         Instantiate a PEFT model from a pretrained model and loaded PEFT weights.
 
@@ -314,7 +324,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 Whether the adapter should be trainable or not. If `False`, the adapter will be frozen and can only be
                 used for inference.
             config ([`~peft.PeftConfig`], *optional*):
-                The configuration object to use instead of an automatically loaded configuation. This configuration
+                The configuration object to use instead of an automatically loaded configuration. This configuration
                 object is mutually exclusive with `model_id` and `kwargs`. This is useful when configuration is already
                 loaded before calling `from_pretrained`.
             kwargs: (`optional`):
@@ -338,6 +348,36 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             config.inference_mode = not is_trainable
         else:
             raise ValueError(f"The input config must be a PeftConfig, got {config.__class__}")
+
+        if hasattr(model, "hf_device_map"):
+            weight_map = dict(named_module_tensors(model, recurse=True))
+
+            # recreate the offload_index for disk-offloaded modules: we need to know the location in storage of each weight
+            # before the offload hook is removed from the model
+            disk_modules = set()
+            index = None
+            for name, module in model.named_modules():
+                if hasattr(module, "_hf_hook") and hasattr(module._hf_hook, "original_devices"):
+                    if hasattr(module._hf_hook.weights_map, "dataset"):
+                        index = module._hf_hook.weights_map.dataset.index
+                    for key in module._hf_hook.original_devices.keys():
+                        if module._hf_hook.original_devices[key] == torch.device("meta"):
+                            disk_modules.add(str(name) + "." + str(key))
+
+            if disk_modules and not kwargs.get("use_safetensors", True):
+                raise ValueError("Disk offloading currently only supported for safetensors")
+
+            if index:
+                offload_index = {
+                    p: {
+                        "safetensors_file": index[p]["safetensors_file"],
+                        "weight_name": p,
+                        "dtype": str(weight_map[p].dtype).replace("torch.", ""),
+                    }
+                    for p in weight_map.keys()
+                    if p in disk_modules
+                }
+                kwargs["offload_index"] = offload_index
 
         if (getattr(model, "hf_device_map", None) is not None) and len(
             set(model.hf_device_map.values()).intersection({"cpu", "disk"})
@@ -508,7 +548,13 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             # one needs to multiply the number of parameters by 2 to get
             # the correct number of parameters
             if param.__class__.__name__ == "Params4bit":
-                num_params = num_params * 2
+                if hasattr(param, "element_size"):
+                    num_bytes = param.element_size()
+                elif not hasattr(param, "quant_storage"):
+                    num_bytes = 1
+                else:
+                    num_bytes = param.quant_storage.itemsize
+                num_params = num_params * 2 * num_bytes
 
             all_param += num_params
             if param.requires_grad:
@@ -519,11 +565,18 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
     def print_trainable_parameters(self) -> None:
         """
         Prints the number of trainable parameters in the model.
+
+        Note: print_trainable_parameters() uses get_nb_trainable_parameters() which is different from
+        num_parameters(only_trainable=True) from huggingface/transformers. get_nb_trainable_parameters() returns
+        (trainable parameters, all parameters) of the Peft Model which includes modified backbone transformer model.
+        For techniques like LoRA, the backbone transformer model is modified in place with LoRA modules. However, for
+        prompt tuning, the backbone transformer model is unmodified. num_parameters(only_trainable=True) returns number
+        of trainable parameters of the backbone transformer model which can be different.
         """
         trainable_params, all_param = self.get_nb_trainable_parameters()
 
         print(
-            f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}"
+            f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param:.4f}"
         )
 
     def __getattr__(self, name: str):
@@ -533,11 +586,31 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         except AttributeError:
             return getattr(self.base_model, name)
 
+    @contextmanager
+    def _enable_peft_forward_hooks(self, *args, **kwargs):
+        # If the base model has a method called _enable_peft_forward_hooks, it is invoked as a context. Otherwise, this
+        # runs without any changes
+        if hasattr(self.base_model, "_enable_peft_forward_hooks"):
+            with self.base_model._enable_peft_forward_hooks(*args, **kwargs):
+                yield
+            return
+        else:
+            # nothing to enable
+            yield
+            return
+
     def forward(self, *args: Any, **kwargs: Any):
         """
         Forward pass of the model.
         """
-        return self.get_base_model()(*args, **kwargs)
+        with self._enable_peft_forward_hooks(*args, **kwargs):
+            kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+            return self.get_base_model()(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        with self._enable_peft_forward_hooks(*args, **kwargs):
+            kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+            return self.get_base_model().generate(*args, **kwargs)
 
     def _get_base_model_class(self, is_prompt_tuning=False):
         """
@@ -559,23 +632,41 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         ...     model(inputs)
         ```
         """
-        try:
-            if self.peft_config[self.active_adapter].is_prompt_learning:
+        if self.peft_config[self.active_adapter].is_prompt_learning:
+            try:
                 # TODO: consider replacing this patching of methods with a more robust mechanism: setting a flag and
-                # letting the underyling methods deal with it, same as how LoRA does it.
+                # letting the underlying methods deal with it, same as how LoRA does it.
                 old_forward = self.forward
                 self.forward = self.base_model.forward
                 old_prepare_inputs_for_generation = self.prepare_inputs_for_generation
                 self.prepare_inputs_for_generation = self.base_model.prepare_inputs_for_generation
-            else:
-                self.base_model.disable_adapter_layers()
-            yield
-        finally:
-            if self.peft_config[self.active_adapter].is_prompt_learning:
+                yield
+            finally:
                 self.forward = old_forward
-                self.old_prepare_inputs_for_generation = old_prepare_inputs_for_generation
-            else:
+                self.prepare_inputs_for_generation = old_prepare_inputs_for_generation
+
+        elif self.peft_config[self.active_adapter].is_adaption_prompt:
+            try:
+                self.base_model.disable_adapter_layers()
+                yield
+            finally:
                 self.base_model.enable_adapter_layers()
+
+        else:  # LoRA, LoHa, etc.
+            model_status = self.get_model_status()
+            if model_status.enabled == "irregular":
+                warnings.warn(
+                    "The model contains some adapter layers that are enabled and others that are disabled. "
+                    "This is most likely unintentional. After exiting the disable_adapter context, all adapters "
+                    "will be enabled"
+                )
+            try:
+                self.base_model.disable_adapter_layers()
+                yield
+            finally:
+                if model_status.enabled is not False:
+                    # model_status.enabled is `True` or `"irregular"`
+                    self.base_model.enable_adapter_layers()
 
     def get_base_model(self) -> torch.nn.Module:
         """
@@ -591,6 +682,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         """
         Add an adapter to the model based on the passed configuration.
 
+        This adapter is not trained. To load a trained adapter, check out [`PeftModel.load_adapter`].
+
         The name for the new adapter should be unique.
 
         The new adapter is not automatically set as the active adapter. Use [`PeftModel.set_adapter`] to set the active
@@ -602,6 +695,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             peft_config ([`PeftConfig`]):
                 The configuration of the adapter to be added.
         """
+        print("add adapter start") # TODO: REMOVE THIS
         if peft_config.peft_type != self.peft_type:
             raise ValueError(
                 f"Cannot combine adapters with different peft types. "
@@ -623,12 +717,13 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             else:
                 self.peft_config[adapter_name] = peft_config
                 self.base_model.inject_adapter(self.base_model.model, adapter_name)
-        except Exception:  # somthing went wrong, roll back
+        except Exception:  # something went wrong, roll back
             if adapter_name in self.peft_config:
                 del self.peft_config[adapter_name]
             raise
 
         self.set_additional_trainable_modules(peft_config, adapter_name)
+        print("add adapter end") # TODO: REMOVE THIS
 
     def set_additional_trainable_modules(self, peft_config, adapter_name):
         if getattr(peft_config, "modules_to_save", None) is not None:
@@ -636,10 +731,80 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 self.modules_to_save = set(peft_config.modules_to_save)
             else:
                 self.modules_to_save.update(peft_config.modules_to_save)
-            _set_trainable(self, adapter_name)
+            _set_trainable(self, adapter_name)  # this may add a new ModulesToSaveWrapper
+
+    def get_layer_status(self) -> list[TunerLayerStatus]:
+        """Get the status of each adapter layer in the model.
+
+        This method returns a list of `TunerLayerStatus` dataclass instances, each of which contains the following
+        attributes:
+
+        - `name` (`str`):
+           The name of the adapter layer, e.g. `model.encoder.block.0.layer.0.SelfAttention.q`.
+        - `module_type` (`str`):
+           The type of the adapter layer, e.g. `lora.Linear`.
+        - `enabled` (`bool`):
+           Whether the adapter layer is enabled.
+        - `active_adapters` (`list[str]`):
+           The names of the active adapters, if any, e.g. `["default"]`.
+        - `merged_adapters` (`list[str]`):
+           The names of the merged adapters, if any, e.g. `["default"]`.
+        - `available_adapters` (`list[str]`):
+           The names of the available adapters, e.g. `["default"]`.
+
+        Args:
+            model ([`~PeftModel`]):
+                The model to get the adapter layer status from.
+
+        Returns:
+            list[`peft.peft_model.TunerLayerStatus`]:
+                A list of dataclasses, each containing the status of the corresponding adapter layer.
+
+        """
+        return get_layer_status(self)
+
+    def get_model_status(self) -> TunerModelStatus:
+        """Get the status of tuners of the model.
+
+        This method returns a `TunerModelStatus` dataclass instance, which contains the following attributes:
+
+        - `base_model_type` (`str`):
+           The type of the base model, e.g. `T5Model`.
+        - `adapter_model_type` (`str`):
+           The type of the adapter model, e.g. `LoraModel`.
+        - `peft_types` (`dict[str, str]`):
+           The mapping of adapter name to adapter type, e.g. `{"default": "LORA"}`.
+        - `trainable_params` (`int`):
+           The number of trainable parameters in the model.
+        - `total_params` (`int`):
+           The total number of parameters in the model.
+        - `num_adapter_layers` (`int`):
+           The number of adapter layers in the model.
+        - `enabled` (`bool`, `Literal["irregular"]`):
+           Whether all adapter layers are enabled. If some are enabled and some are not, this will be `"irregular"`.
+           This means that your model is in an inconsistent state and might not work as expected.
+        - `active_adapters` (`list[str]`, `Literal["irregular"]`):
+           The names of the active adapters. If the active adapters are not consistent across all layers, this will be
+           `"irregular"`, which means that your model is in an inconsistent state and might not work as expected.
+        - `merged_adapters` (`list[str]`, `Literal["irregular"]`):
+           The names of the merged adapters. If the merged adapters are not consistent across all layers, this will be
+           `"irregular"`, which means that your model is in an inconsistent state and might not work as expected.
+        - `available_adapters` (`list[str]`):
+           The names of the available adapters, e.g. `["default"]`.
+
+        Args:
+            model ([`~PeftModel`]):
+                The model to get the adapter layer status from.
+
+        Returns:
+            `peft.peft_model.TunerModelStatus`:
+                A dataclass containing the status of the model.
+
+        """
+        return get_model_status(self)
 
     @classmethod
-    def _split_kwargs(cls, kwargs: Dict[str, Any]):
+    def _split_kwargs(cls, kwargs: dict[str, Any]):
         _kwargs_not_in_hf_hub_download_signature = ("use_auth_token",)
         hf_hub_download_kwargs = {}
         other_kwargs = {}
@@ -652,7 +817,94 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         return hf_hub_download_kwargs, other_kwargs
 
-    def load_adapter(self, model_id: str, adapter_name: str, is_trainable: bool = False, **kwargs: Any):
+    def _update_offload(self, offload_index: dict[str, dict[str, str]], adapters_weights: dict[str, torch.tensor]):
+        """
+        Update the offload_index and safetensors files for loading and mergine PeftModels with disk-offloaded modules.
+
+        Args:
+            offload_index (Dict[str: str]):
+                Dictionary of disk-offloaded modules with their metadata and safetensors filenames
+            adapters_weights (Dict[str: torch.tensor]):
+                Dictionary of Peft adapter module names and weights
+        """
+
+        if not offload_index:
+            return offload_index
+
+        prefix = "base_model.model."
+        # rename offload index weight and model names
+        adapter_names = list(self.peft_config.keys())
+        for adapter_name in adapter_names:
+            keys = list(offload_index.keys())
+            block_id = keys[0].split(".")[0] + "."  # for writing safetensors key,
+
+            # replace original offload index keys with PeftModel keys
+            for key in keys:
+                suffix_pos = key.rfind(".")
+                extended_prefix = prefix + key[:suffix_pos]
+                module = dict(self.named_modules())[extended_prefix]
+                if isinstance(module, BaseTunerLayer):
+                    new_key = prefix + key[:suffix_pos] + ".base_layer" + key[suffix_pos:]
+                else:
+                    new_key = prefix + key
+                offload_index[key]["weight_name"] = new_key
+                offload_index[new_key] = offload_index[key]
+                del offload_index[key]
+
+            files_seen = set()
+            # rename safetensors for dispatch
+            for new_key in list(offload_index.keys()):
+                fname = offload_index[new_key]["safetensors_file"]
+
+                # make a new file name
+                new_fname_list = list(fname.split(os.sep))
+                for i, name in enumerate(new_fname_list):
+                    if "--" in name:
+                        new_fname_list[i] += "-peft"
+                        break
+                new_fname = os.path.join(*new_fname_list)
+
+                if fname in files_seen:
+                    continue
+                safe_dict = {}
+                with safe_open(fname, framework="pt") as f:
+                    for safe_key in f.keys():
+                        safe_tensor = f.get_tensor(safe_key)
+                        metadata = f.metadata()
+                        suffix_pos = safe_key.rfind(".")
+                        extended_prefix = prefix + block_id + safe_key[:suffix_pos]
+                        safe_module = dict(self.named_modules())[extended_prefix]
+                        if isinstance(safe_module, BaseTunerLayer):
+                            final_key = extended_prefix + ".base_layer" + safe_key[suffix_pos:]
+                            lora_dict = {key: val for key, val in adapters_weights.items() if extended_prefix in key}
+
+                            # add LoRA keys and values to disk offload
+                            for lora_key, lora_val in lora_dict.items():
+                                divide = lora_key.rfind(".")
+                                new_key = lora_key[:divide] + f".{adapter_name}" + lora_key[divide:]
+                                safe_dict[new_key] = lora_val
+                        else:
+                            final_key = prefix + block_id + safe_key
+                        safe_dict[final_key] = safe_tensor
+                    files_seen.add(new_fname)
+
+                    # avoid overwriting original safetensors
+                    for key in safe_dict.keys():
+                        offload_index[key] = {"safetensors_file": new_fname, "weight_name": key}
+
+                    base_name = os.path.dirname(new_fname)
+                    if not os.path.exists(base_name):
+                        os.makedirs(base_name)
+                    safe_save_file(safe_dict, new_fname, metadata=metadata)
+
+    def load_adapter(
+        self,
+        model_id: str,
+        adapter_name: str,
+        is_trainable: bool = False,
+        torch_device: Optional[str] = None,
+        **kwargs: Any,
+    ):
         """
         Load a trained adapter into the model.
 
@@ -669,13 +921,16 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             is_trainable (`bool`, *optional*, defaults to `False`):
                 Whether the adapter should be trainable or not. If `False`, the adapter will be frozen and can only be
                 used for inference.
+            torch_device (`str`, *optional*, defaults to None):
+                The device to load the adapter on. If `None`, the device will be inferred.
             kwargs: (`optional`):
                 Additional arguments to modify the way the adapter is loaded, e.g. the token for Hugging Face Hub.
         """
         from .mapping import PEFT_TYPE_TO_CONFIG_MAPPING
 
         hf_hub_download_kwargs, kwargs = self._split_kwargs(kwargs)
-        torch_device = infer_device()
+        if torch_device is None:
+            torch_device = infer_device()
 
         if adapter_name not in self.peft_config:
             # load the config
@@ -697,7 +952,10 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         adapters_weights = load_peft_weights(model_id, device=torch_device, **hf_hub_download_kwargs)
 
         # load the weights into the model
-        load_result = set_peft_model_state_dict(self, adapters_weights, adapter_name=adapter_name)
+        ignore_mismatched_sizes = kwargs.get("ignore_mismatched_sizes", False)
+        load_result = set_peft_model_state_dict(
+            self, adapters_weights, adapter_name=adapter_name, ignore_mismatched_sizes=ignore_mismatched_sizes
+        )
         if (
             (getattr(self, "hf_device_map", None) is not None)
             and (len(set(self.hf_device_map.values()).intersection({"cpu", "disk"})) > 0)
@@ -723,16 +981,22 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                     no_split_module_classes=no_split_module_classes,
                     low_zero=(device_map == "balanced_low_0"),
                 )
+
             if isinstance(device_map, str):
                 device_map = infer_auto_device_map(
                     self, max_memory=max_memory, no_split_module_classes=no_split_module_classes
                 )
+
+            self._update_offload(offload_index, adapters_weights)
+            dispatch_model_kwargs["offload_index"] = offload_index
+
             dispatch_model(
                 self,
                 device_map=device_map,
                 offload_dir=offload_dir,
                 **dispatch_model_kwargs,
             )
+
             hook = AlignDevicesHook(io_same_device=True)
             if self.peft_config[adapter_name].is_prompt_learning:
                 remove_hook_from_submodules(self.prompt_encoder)
@@ -749,6 +1013,15 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         Only one adapter can be active at a time.
 
+        Additionally, this function will set the specified adapter to trainable (i.e., requires_grad=True). If this is
+        not desired, use the following code.
+
+        ```py
+        >>> for name, param in model_peft.named_parameters():
+        ...     if ...:  # some check on name (ex. if 'lora' in name)
+        ...         param.requires_grad = False
+        ```
+
         Args:
             adapter_name (`str`):
                 The name of the adapter to be set as active. The adapter must be loaded first.
@@ -760,16 +1033,19 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model.set_adapter(adapter_name)
         _set_adapter(self, adapter_name)
 
-    def batch_adapters(self, adapter_lst: list, save_directory=None)->None:
+    def batch_adapters(self, adapter_lst: list, save_directory=None, **kwargs)->None:
         print("model: batching adapter")
         # create a config for the new adapter
         # extract the 0th adapter's config as the batched_adapter's config
         config = self.peft_config[adapter_lst[0]]
         self.add_adapter("batched_adapter", config)
-
+        if isinstance(self.base_model, BOFTModel):
+            self.base_model.move_all_boft_r_s_to_cpu() # clear out memory 
+            torch.cuda.synchronize()
+            print("finished move boft weights to cpu")
         # batch adapters
-        self.base_model.batch_adapters(adapter_lst)
-        print("after batch adapter:\n", self.base_model)
+        self.base_model.batch_adapters(adapter_lst, **kwargs)
+        print("model finished batching")
 
         # QUESTION: update config?
         # NOTE: currently peft enforces the shape to be consistent. But after 
@@ -810,7 +1086,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         model_config = getattr(self, "config", None)
         if hasattr(model_config, "to_dict"):
             model_config = model_config.to_dict()
-        if model_config is not None:
+        if model_config is not None and "_name_or_path" in model_config:
             card.data["base_model"] = model_config["_name_or_path"]
 
         lines = card.text.splitlines()
@@ -887,18 +1163,53 @@ class PeftModelForSequenceClassification(PeftModel):
 
     def __init__(self, model: torch.nn.Module, peft_config: PeftConfig, adapter_name: str = "default") -> None:
         super().__init__(model, peft_config, adapter_name)
+
+        classifier_module_names = ["classifier", "score"]
         if self.modules_to_save is None:
-            self.modules_to_save = {"classifier", "score"}
+            self.modules_to_save = set(classifier_module_names)
         else:
-            self.modules_to_save.update({"classifier", "score"})
+            self.modules_to_save.update(classifier_module_names)
+
+        if hasattr(peft_config, "modules_to_save"):
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = classifier_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(classifier_module_names)
 
         for name, _ in self.base_model.named_children():
             if any(module_name in name for module_name in self.modules_to_save):
                 self.cls_layer_name = name
                 break
 
-        # to make sure classifier layer is trainable
+        # to make sure classifier layer is trainable; this may add a new ModulesToSaveWrapper
         _set_trainable(self, adapter_name)
+
+    def add_adapter(self, adapter_name: str, peft_config: PeftConfig) -> None:
+        """
+        Add an adapter to the model based on the passed configuration.
+
+        This adapter is not trained. To load a trained adapter, check out [`PeftModel.load_adapter`].
+
+        The name for the new adapter should be unique.
+
+        The new adapter is not automatically set as the active adapter. Use [`PeftModel.set_adapter`] to set the active
+        adapter.
+
+        Args:
+            adapter_name (`str`):
+                The name of the adapter to be added.
+            peft_config ([`PeftConfig`]):
+                The configuration of the adapter to be added.
+        """
+        # ensure that additional adapters also add the classifier layer to modules_to_save
+        if hasattr(peft_config, "modules_to_save"):
+            classifier_module_names = ["classifier", "score"]
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = classifier_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(classifier_module_names)
+
+        return super().add_adapter(adapter_name, peft_config)
 
     def forward(
         self,
@@ -915,18 +1226,20 @@ class PeftModelForSequenceClassification(PeftModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         peft_config = self.active_peft_config
         if not peft_config.is_prompt_learning:
-            if peft_config.peft_type == PeftType.POLY:
-                kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                if peft_config.peft_type == PeftType.POLY:
+                    kwargs["task_ids"] = task_ids
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if attention_mask is not None:
@@ -1106,16 +1419,19 @@ class PeftModelForCausalLM(PeftModel):
 
             if peft_config.peft_type == PeftType.POLY:
                 kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if attention_mask is not None:
@@ -1156,14 +1472,20 @@ class PeftModelForCausalLM(PeftModel):
             inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
             return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
 
-    def generate(self, **kwargs):
+    def generate(self, *args, **kwargs):
+        peft_config = self.active_peft_config
         self.base_model.prepare_inputs_for_generation = self.prepare_inputs_for_generation
         if hasattr(self.base_model, "model"):
             self.base_model.model.generation_config = self.generation_config
         else:
             self.base_model.generation_config = self.generation_config
         try:
-            outputs = self.base_model.generate(**kwargs)
+            if not peft_config.is_prompt_learning:
+                with self._enable_peft_forward_hooks(*args, **kwargs):
+                    kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                    outputs = self.base_model.generate(*args, **kwargs)
+            else:
+                outputs = self.base_model.generate(**kwargs)
         except:
             self.base_model.prepare_inputs_for_generation = self.base_model_prepare_inputs_for_generation
             raise
@@ -1171,7 +1493,7 @@ class PeftModelForCausalLM(PeftModel):
             self.base_model.prepare_inputs_for_generation = self.base_model_prepare_inputs_for_generation
             return outputs
 
-    def prepare_inputs_for_generation(self, *args, task_ids: torch.Tensor = None, **kwargs):
+    def prepare_inputs_for_generation(self, *args, task_ids: Optional[torch.Tensor] = None, **kwargs):
         peft_config = self.active_peft_config
         model_kwargs = self.base_model_prepare_inputs_for_generation(*args, **kwargs)
 
@@ -1222,6 +1544,12 @@ class PeftModelForCausalLM(PeftModel):
                     prompts = prompts.to(inputs_embeds.dtype)
                     model_kwargs["inputs_embeds"] = torch.cat((prompts, inputs_embeds), dim=1)
                     model_kwargs["input_ids"] = None
+
+        # For transformers>=4.38.0 - for some architectures such as Llama, `cache_position` is
+        # passed in the forward pass to keep track of the position ids of the cache. We have to
+        # pop that from `model_kwargs` as `cache_position` is properly created by the model, using the passed
+        # `inputs_embeds`: https://github.com/huggingface/transformers/blob/593230f0a1150ea9c0477b9d859f25daf73c8c33/src/transformers/models/llama/modeling_llama.py#L956
+        _ = model_kwargs.pop("cache_position", None)
 
         return model_kwargs
 
@@ -1288,19 +1616,22 @@ class PeftModelForSeq2SeqLM(PeftModel):
         if not peft_config.is_prompt_learning:
             if peft_config.peft_type == PeftType.POLY:
                 kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                decoder_input_ids=decoder_input_ids,
-                decoder_attention_mask=decoder_attention_mask,
-                decoder_inputs_embeds=decoder_inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    decoder_input_ids=decoder_input_ids,
+                    decoder_attention_mask=decoder_attention_mask,
+                    decoder_inputs_embeds=decoder_inputs_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if decoder_attention_mask is not None:
@@ -1401,7 +1732,9 @@ class PeftModelForSeq2SeqLM(PeftModel):
         )
         try:
             if not peft_config.is_prompt_learning:
-                outputs = self.base_model.generate(**kwargs)
+                with self._enable_peft_forward_hooks(**kwargs):
+                    kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                    outputs = self.base_model.generate(**kwargs)
             else:
                 if "input_ids" not in kwargs:
                     raise ValueError("input_ids must be provided for Peft model generation")
@@ -1426,7 +1759,7 @@ class PeftModelForSeq2SeqLM(PeftModel):
                     kwargs = deepcopy(kwargs)
 
                     if "encoder_outputs" in kwargs:
-                        del kwargs["encoder_ouputs"]
+                        del kwargs["encoder_outputs"]
                         warnings.warn(
                             "`encoder_outputs` should not be passed to `generate` when using prompt tuning. Ignoring it."
                         )
@@ -1517,18 +1850,53 @@ class PeftModelForTokenClassification(PeftModel):
 
     def __init__(self, model: torch.nn.Module, peft_config: PeftConfig = None, adapter_name: str = "default") -> None:
         super().__init__(model, peft_config, adapter_name)
+
+        classifier_module_names = ["classifier", "score"]
         if self.modules_to_save is None:
-            self.modules_to_save = {"classifier", "score"}
+            self.modules_to_save = set(classifier_module_names)
         else:
-            self.modules_to_save.update({"classifier", "score"})
+            self.modules_to_save.update(classifier_module_names)
+
+        if hasattr(peft_config, "modules_to_save"):
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = classifier_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(classifier_module_names)
 
         for name, _ in self.base_model.named_children():
             if any(module_name in name for module_name in self.modules_to_save):
                 self.cls_layer_name = name
                 break
 
-        # to make sure classifier layer is trainable
+        # to make sure classifier layer is trainable; this may add a new ModulesToSaveWrapper
         _set_trainable(self, adapter_name)
+
+    def add_adapter(self, adapter_name: str, peft_config: PeftConfig) -> None:
+        """
+        Add an adapter to the model based on the passed configuration.
+
+        This adapter is not trained. To load a trained adapter, check out [`PeftModel.load_adapter`].
+
+        The name for the new adapter should be unique.
+
+        The new adapter is not automatically set as the active adapter. Use [`PeftModel.set_adapter`] to set the active
+        adapter.
+
+        Args:
+            adapter_name (`str`):
+                The name of the adapter to be added.
+            peft_config ([`PeftConfig`]):
+                The configuration of the adapter to be added.
+        """
+        # ensure that additional adapters also add the classifier layer to modules_to_save
+        if hasattr(peft_config, "modules_to_save"):
+            classifier_module_names = ["classifier", "score"]
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = classifier_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(classifier_module_names)
+
+        return super().add_adapter(adapter_name, peft_config)
 
     def forward(
         self,
@@ -1546,18 +1914,20 @@ class PeftModelForTokenClassification(PeftModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if not peft_config.is_prompt_learning:
-            if peft_config.peft_type == PeftType.POLY:
-                kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                labels=labels,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                if peft_config.peft_type == PeftType.POLY:
+                    kwargs["task_ids"] = task_ids
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if attention_mask is not None:
@@ -1690,18 +2060,53 @@ class PeftModelForQuestionAnswering(PeftModel):
 
     def __init__(self, model: torch.nn.Module, peft_config: PeftConfig, adapter_name: str = "default") -> None:
         super().__init__(model, peft_config, adapter_name)
+
+        qa_module_names = ["qa_outputs"]
         if self.modules_to_save is None:
-            self.modules_to_save = {"qa_outputs"}
+            self.modules_to_save = set(qa_module_names)
         else:
-            self.modules_to_save.update({"qa_outputs"})
+            self.modules_to_save.update(qa_module_names)
+
+        if hasattr(peft_config, "modules_to_save"):
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = qa_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(qa_module_names)
 
         for name, _ in self.base_model.named_children():
             if any(module_name in name for module_name in self.modules_to_save):
                 self.cls_layer_name = name
                 break
 
-        # to make sure classifier layer is trainable
+        # to make sure classifier layer is trainable; this may add a new ModulesToSaveWrapper
         _set_trainable(self, adapter_name)
+
+    def add_adapter(self, adapter_name: str, peft_config: PeftConfig) -> None:
+        """
+        Add an adapter to the model based on the passed configuration.
+
+        This adapter is not trained. To load a trained adapter, check out [`PeftModel.load_adapter`].
+
+        The name for the new adapter should be unique.
+
+        The new adapter is not automatically set as the active adapter. Use [`PeftModel.set_adapter`] to set the active
+        adapter.
+
+        Args:
+            adapter_name (`str`):
+                The name of the adapter to be added.
+            peft_config ([`PeftConfig`]):
+                The configuration of the adapter to be added.
+        """
+        # ensure that additional adapters also add the classifier layer to modules_to_save
+        if hasattr(peft_config, "modules_to_save"):
+            qa_module_names = ["qa_outputs"]
+            if peft_config.modules_to_save is None:
+                peft_config.modules_to_save = qa_module_names[:]
+            else:
+                peft_config.modules_to_save.extend(qa_module_names)
+
+        return super().add_adapter(adapter_name, peft_config)
 
     def forward(
         self,
@@ -1724,17 +2129,20 @@ class PeftModelForQuestionAnswering(PeftModel):
         if not peft_config.is_prompt_learning:
             if peft_config.peft_type == PeftType.POLY:
                 kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                start_positions=start_positions,
-                end_positions=end_positions,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    start_positions=start_positions,
+                    end_positions=end_positions,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if attention_mask is not None:
@@ -1898,15 +2306,18 @@ class PeftModelForFeatureExtraction(PeftModel):
         if not peft_config.is_prompt_learning:
             if peft_config.peft_type == PeftType.POLY:
                 kwargs["task_ids"] = task_ids
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=inputs_embeds,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-                **kwargs,
-            )
+
+            with self._enable_peft_forward_hooks(**kwargs):
+                kwargs = {k: v for k, v in kwargs.items() if k not in self.special_peft_forward_args}
+                return self.base_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    inputs_embeds=inputs_embeds,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    **kwargs,
+                )
 
         batch_size = _get_batch_size(input_ids, inputs_embeds)
         if attention_mask is not None:
@@ -1939,3 +2350,259 @@ class PeftModelForFeatureExtraction(PeftModel):
             prompts = prompts.to(inputs_embeds.dtype)
             inputs_embeds = torch.cat((prompts, inputs_embeds), dim=1)
             return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
+
+
+@dataclass
+class TunerLayerStatus:
+    name: str
+    module_type: str
+    enabled: bool
+    active_adapters: list[str]
+    merged_adapters: list[str]
+    requires_grad: dict[str, bool | Literal["irregular"]]
+    available_adapters: list[str]
+
+
+def get_layer_status(model: torch.nn.Module) -> list[TunerLayerStatus]:
+    """Get the status of each adapter layer in the model.
+
+    This function returns a list of `TunerLayerStatus` dataclass instances, each of which contains the following
+    attributes:
+
+    - `name` (`str`):
+       The name of the adapter layer, e.g. `model.encoder.block.0.layer.0.SelfAttention.q`.
+    - `module_type` (`str`):
+       The type of the adapter layer, e.g. `lora.Linear`.
+    - `enabled` (`bool`):
+       Whether the adapter layer is enabled.
+    - `active_adapters` (`list[str]`):
+       The names of the active adapters, if any, e.g. `["default"]`.
+    - `merged_adapters` (`list[str]`):
+       The names of the merged adapters, if any, e.g. `["default"]`.
+    - requires_grad : dict[str, bool | Literal["irregular"]]
+       The requires_grad status of the parameters for each adapter module. Ideally, it should be either `True` or
+       `False`. If the requires_grad status is not consistent across all parameters, the value will be set to
+       `"irregular"`.
+    - `available_adapters` (`list[str]`):
+       The names of the available adapters, e.g. `["default"]`.
+
+    Args:
+        model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
+            The model to get the adapter layer status from.
+
+    Returns:
+        list[`peft.peft_model.TunerLayerStatus`]:
+            A list of dataclasses, each containing the status of the corresponding adapter layer.
+
+    """
+    if isinstance(model, PeftModel):
+        base_model = model.base_model
+        if not isinstance(base_model, BaseTuner):
+            raise TypeError(
+                "get_layer_status() got an invalid PeftModel instance; prefix tuning and adaption prompt are not "
+                "supported."
+            )
+    else:
+        base_model = model
+
+    layer_status: list[TunerLayerStatus] = []
+    for name, module in base_model.named_modules():
+        if not isinstance(module, BaseTunerLayer):
+            continue
+
+        # determine if all submodules/parameters if this module require grad or not
+        mapping_requires_grad_list: dict[str, list[bool]] = collections.defaultdict(list)
+        for adapter_module_name in module.adapter_layer_names:
+            adapter_module = getattr(module, adapter_module_name)
+            if isinstance(adapter_module, torch.nn.ModuleDict):
+                for key, submodule in adapter_module.items():
+                    for param in submodule.parameters():
+                        mapping_requires_grad_list[key].append(param.requires_grad)
+            elif isinstance(adapter_module, torch.nn.ParameterDict):
+                for key, param in adapter_module.items():
+                    mapping_requires_grad_list[key].append(param.requires_grad)
+            else:
+                # strange, we don't know how to handle this, ignore for now
+                pass
+
+        def check_irrgular(vals: list[bool]) -> bool | Literal["irregular"]:
+            if all(vals):
+                return True
+            if not any(vals):
+                return False
+            return "irregular"
+
+        requires_grad = {key: check_irrgular(vals) for key, vals in mapping_requires_grad_list.items()}
+
+        status = TunerLayerStatus(
+            name=name,
+            module_type=repr(module).partition("(")[0],
+            enabled=not module.disable_adapters,
+            active_adapters=module.active_adapters,
+            merged_adapters=module.merged_adapters,
+            requires_grad=requires_grad,
+            available_adapters=sorted(module._get_available_adapters()),
+        )
+        layer_status.append(status)
+
+    if not layer_status:
+        raise ValueError(
+            "No adapter layers found in the model, please ensure that it's a PEFT model or that you have PEFT adapters "
+            "injected in the model."
+        )
+
+    return layer_status
+
+
+@dataclass
+class TunerModelStatus:
+    base_model_type: str
+    adapter_model_type: str
+    peft_types: dict[str, str]
+    trainable_params: int
+    total_params: int
+    num_adapter_layers: int
+    enabled: bool | Literal["irregular"]
+    active_adapters: list[str] | Literal["irregular"]
+    merged_adapters: list[str] | Literal["irregular"]
+    requires_grad: dict[str, bool | Literal["irregular"]]
+    available_adapters: list[str]
+
+
+def get_model_status(model: torch.nn.Module) -> TunerModelStatus:
+    """Get the status of tuners of the model.
+
+    This function returns a `TunerModelStatus` dataclass instance, which contains the following attributes:
+
+    - `base_model_type` (`str`):
+       The type of the base model, e.g. `T5Model`.
+    - `adapter_model_type` (`str`):
+       The type of the adapter model, e.g. `LoraModel`.
+    - `peft_types` (`dict[str, str]`):
+       The mapping of adapter name to adapter type, e.g. `{"default": "LORA"}`.
+    - `trainable_params` (`int`):
+       The number of trainable parameters in the model.
+    - `total_params` (`int`):
+       The total number of parameters in the model.
+    - `num_adapter_layers` (`int`):
+       The number of adapter layers in the model.
+    - `enabled` (`bool`, `Literal["irregular"]`):
+       Whether all adapter layers are enabled. If some are enabled and some are not, this will be `"irregular"`. This
+       means that your model is in an inconsistent state and might not work as expected.
+    - `active_adapters` (`list[str]`, `Literal["irregular"]`):
+       The names of the active adapters. If the active adapters are not consistent across all layers, this will be
+       `"irregular"`, which means that your model is in an inconsistent state and might not work as expected.
+    - `merged_adapters` (`list[str]`, `Literal["irregular"]`):
+       The names of the merged adapters. If the merged adapters are not consistent across all layers, this will be
+       `"irregular"`, which means that your model is in an inconsistent state and might not work as expected.
+    - `requires_grad` (`dict[str, bool | Literal["irregular"]]`):
+       Whether for the given adapter, all adapter layers have `requires_grad` set to `True` or `False`. If there is a
+       mix, this will be set to `"irregular"`, which means that your model is in an inconsistent state and might not
+       work as expected.
+    - `available_adapters` (`list[str]`):
+       The names of the available adapters, e.g. `["default"]`.
+
+    Args:
+        model ([Union[`~PeftModel`, `~transformers.PreTrainedModel`, `nn.Module`]]):
+            The model to get the adapter layer status from.
+
+    Returns:
+        `peft.peft_model.TunerModelStatus`:
+            A dataclass containing the status of the model.
+
+    """
+    if isinstance(model, PeftModel):
+        if not isinstance(model.base_model, BaseTuner):
+            raise TypeError(
+                "get_model_status() got an invalid PeftModel instance; prefix tuning and adaption prompt are not "
+                "supported."
+            )
+        base_model_type = model.get_base_model().__class__.__name__
+        trainable_params, total_params = model.get_nb_trainable_parameters()
+        base_model = model.base_model
+        peft_types = {key: str(config.peft_type).partition(".")[-1] for key, config in base_model.peft_config.items()}
+        adapter_model_type = base_model.__class__.__name__
+    elif isinstance(model, PreTrainedModel):
+        base_model_type = model.__class__.__name__
+        trainable_params, total_params = PeftModel.get_nb_trainable_parameters(model)
+        base_model = model
+        peft_types = {}
+        adapter_model_type = "None"
+    else:
+        base_model_type = "other"
+        trainable_params, total_params = PeftModel.get_nb_trainable_parameters(model)
+        base_model = model
+        peft_types = {}
+        adapter_model_type = "None"
+
+    layer_status = get_layer_status(model)
+    num_adapter_layers = len(layer_status)
+
+    enabled_set: set[bool] = {status.enabled for status in layer_status}  # must be {True}, {False}, or {True, False}
+    enabled: bool | Literal["irregular"]
+    if len(enabled_set) == 1:
+        enabled = enabled_set.pop()
+    else:
+        enabled = "irregular"
+
+    available_adapters: list[str] = sorted(set().union(*(status.available_adapters for status in layer_status)))
+
+    # ideally, active adapters should be consistent across all layers of the model, but we cannot guarantee it
+    all_active_adapters: set[tuple[str, ...]] = {tuple(status.active_adapters) for status in layer_status}
+    active_adapters: list[str] | Literal["irregular"]
+    if not all_active_adapters:
+        active_adapters = []
+    elif len(all_active_adapters) == 1:
+        active_adapters = list(all_active_adapters.pop())
+    else:
+        active_adapters = "irregular"
+
+    # Here we determine what adapters are merged. This is not trivial because multiple adapters can be merged or not at
+    # the same time. Some layers may only have adapter A, some only adapter B, so it's not as easy as just checking
+    # which adapters are merged on each layer.
+
+    # First, determine all adapters that are merged on at least on module.
+    merged_all: set[str] = set()
+    for status in layer_status:
+        merged_all.update(status.merged_adapters)
+
+    # Next, check if on any layer, on of these adapters is not merged.
+    merged_adapters: list[str] | Literal["irregular"] = sorted(merged_all)
+    for status in layer_status:
+        unmerged = set(status.available_adapters) - set(status.merged_adapters)
+        if unmerged & merged_all:
+            # there is overlap between unmerged adapters and adapters that should be merged
+            merged_adapters = "irregular"
+            break
+
+    # check status of requires_grad
+    # first, merge the values for all layers
+    requires_grad_all: dict[str, list[bool | Literal["irregular"]]] = collections.defaultdict(list)
+    for status in layer_status:
+        for key, val in status.requires_grad.items():
+            requires_grad_all[key].append(val)
+
+    # then, check if the values are consistent
+    def check_irrgular(vals: list[bool | Literal["irregular"]]) -> bool | Literal["irregular"]:
+        if all(val is True for val in vals):
+            return True
+        if all(val is False for val in vals):
+            return False
+        return "irregular"
+
+    requires_grad = {key: check_irrgular(vals) for key, vals in requires_grad_all.items()}
+
+    adapter_model_status = TunerModelStatus(
+        base_model_type=base_model_type,
+        adapter_model_type=adapter_model_type,
+        peft_types=peft_types,
+        trainable_params=trainable_params,
+        total_params=total_params,
+        num_adapter_layers=num_adapter_layers,
+        enabled=enabled,
+        active_adapters=active_adapters,
+        merged_adapters=merged_adapters,
+        requires_grad=requires_grad,
+        available_adapters=available_adapters,
+    )
+    return adapter_model_status

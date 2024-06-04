@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,13 +13,18 @@
 # limitations under the License.
 import copy
 import inspect
+import os
 import warnings
+from contextlib import nullcontext
 from typing import Optional, Tuple
 
 import accelerate
 import torch
 from accelerate.hooks import add_hook_to_module, remove_hook_from_module
 from accelerate.utils import is_npu_available, is_xpu_available
+from huggingface_hub import file_exists
+from huggingface_hub.utils import EntryNotFoundError, HFValidationError
+from packaging import version
 from safetensors.torch import storage_ptr, storage_size
 
 from ..import_utils import is_auto_gptq_available, is_torch_tpu_available
@@ -32,12 +36,21 @@ from .constants import (
     TRANSFORMERS_MODELS_TO_ADALORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_IA3_FEEDFORWARD_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING,
+    TRANSFORMERS_MODELS_TO_LNTUNING_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING,
+    TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING,
     WEIGHTS_NAME,
     bloom_model_postprocess_past_key_value,
     starcoder_model_postprocess_past_key_value,
 )
+
+
+mlu_available = False
+if version.parse(accelerate.__version__) >= version.parse("0.29.0"):
+    from accelerate.utils import is_mlu_available
+
+    mlu_available = is_mlu_available()
 
 
 __all__ = [
@@ -49,6 +62,8 @@ __all__ = [
     "TRANSFORMERS_MODELS_TO_IA3_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING",
     "TRANSFORMERS_MODELS_TO_PREFIX_TUNING_POSTPROCESS_MAPPING",
+    "TRANSFORMERS_MODELS_TO_LNTUNING_TARGET_MODULES_MAPPING",
+    "TRANSFORMERS_MODELS_TO_VERA_TARGET_MODULES_MAPPING",
     "WEIGHTS_NAME",
     "INCLUDE_LINEAR_LAYERS_SHORTHAND",
     "bloom_model_postprocess_past_key_value",
@@ -57,18 +72,18 @@ __all__ = [
 
 
 # Get current device name based on available devices
-def infer_device():
+def infer_device() -> str:
     if torch.cuda.is_available():
-        torch_device = "cuda"
+        return "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        torch_device = torch.device("mps")
+        return "mps"
+    elif mlu_available:
+        return "mlu"
     elif is_xpu_available():
-        torch_device = "xpu"
+        return "xpu"
     elif is_npu_available():
-        torch_device = "npu"
-    else:
-        torch_device = "cpu"
-    return torch_device
+        return "npu"
+    return "cpu"
 
 
 def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, gradient_checkpointing_kwargs=None):
@@ -91,6 +106,10 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
     """
     loaded_in_kbit = getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False)
     is_gptq_quantized = getattr(model, "quantization_method", None) == "gptq"
+    is_aqlm_quantized = getattr(model, "quantization_method", None) == "aqlm"
+    is_eetq_quantized = getattr(model, "quantization_method", None) == "eetq"
+    is_hqq_quantized = getattr(model, "quantization_method", None) == "hqq" or getattr(model, "hqq_quantized", False)
+
     if gradient_checkpointing_kwargs is None:
         gradient_checkpointing_kwargs = {}
 
@@ -98,13 +117,17 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
         # freeze base model's layers
         param.requires_grad = False
 
-    if not is_gptq_quantized:
+    if not is_gptq_quantized and not is_aqlm_quantized and not is_eetq_quantized and not is_hqq_quantized:
         # cast all non INT8 parameters to fp32
         for param in model.parameters():
-            if (param.dtype == torch.float16) or (param.dtype == torch.bfloat16):
+            if (
+                (param.dtype == torch.float16) or (param.dtype == torch.bfloat16)
+            ) and param.__class__.__name__ != "Params4bit":
                 param.data = param.data.to(torch.float32)
 
-    if (loaded_in_kbit or is_gptq_quantized) and use_gradient_checkpointing:
+    if (
+        loaded_in_kbit or is_gptq_quantized or is_aqlm_quantized or is_eetq_quantized or is_hqq_quantized
+    ) and use_gradient_checkpointing:
         # When having `use_reentrant=False` + gradient_checkpointing, there is no need for this hack
         if "use_reentrant" not in gradient_checkpointing_kwargs or gradient_checkpointing_kwargs["use_reentrant"]:
             # For backward compatibility
@@ -138,15 +161,6 @@ def prepare_model_for_kbit_training(model, use_gradient_checkpointing=True, grad
     return model
 
 
-# For backward compatibility
-def prepare_model_for_int8_training(*args, **kwargs):
-    warnings.warn(
-        "prepare_model_for_int8_training is deprecated and will be removed in a future version. Use prepare_model_for_kbit_training instead.",
-        FutureWarning,
-    )
-    return prepare_model_for_kbit_training(*args, **kwargs)
-
-
 # copied from transformers.models.bart.modeling_bart
 def shift_tokens_right(input_ids: torch.Tensor, pad_token_id: int, decoder_start_token_id: int):
     """
@@ -177,6 +191,17 @@ class ModulesToSaveWrapper(torch.nn.Module):
         self._active_adapter = adapter_name
         self._disable_adapters = False
         self.update(adapter_name)
+        self.check_module()
+
+    def check_module(self):
+        """Perform some sanity checks on the module to ensure that it works"""
+        # Try to anticipate some modules that users could try to target that would not work.
+        # Note: It's not possible to check hasattr(module, "forward"), since that returns True for ModuleDict and
+        # ModuleList, even though their forward methods cannot be called
+        forbidden_classes = (torch.nn.ModuleDict, torch.nn.ModuleList, torch.nn.ParameterDict, torch.nn.ParameterList)
+        if isinstance(self.original_module, forbidden_classes):
+            cls_name = self.original_module.__class__.__name__
+            raise TypeError(f"modules_to_save cannot be applied to modules of type {cls_name}")
 
     @property
     def disable_adapters(self) -> bool:
@@ -195,7 +220,17 @@ class ModulesToSaveWrapper(torch.nn.Module):
         return self.modules_to_save[self.active_adapter].weight
 
     def update(self, adapter_name):
-        self.modules_to_save.update(torch.nn.ModuleDict({adapter_name: copy.deepcopy(self.original_module)}))
+        context_manager = nullcontext()
+        for _, param in self.original_module.named_parameters():
+            num_params = param.numel()
+            # if using DS Zero 3 and the weights are initialized empty
+            if num_params == 0 and hasattr(param, "ds_numel"):
+                import deepspeed
+
+                context_manager = deepspeed.zero.GatheredParameters(self.original_module.parameters(), modifier_rank=0)
+                break
+        with context_manager:
+            self.modules_to_save.update(torch.nn.ModuleDict({adapter_name: copy.deepcopy(self.original_module)}))
 
         if hasattr(self.modules_to_save[adapter_name], "_hf_hook"):
             old_hook = self.modules_to_save[adapter_name]._hf_hook
@@ -249,6 +284,15 @@ class ModulesToSaveWrapper(torch.nn.Module):
 
     def set_adapter(self, adapter_name: str):
         """Set the active adapter
+
+        Additionally, this function will set the specified adapter to trainable (i.e., requires_grad=True). If this is
+        not desired, use the following code.
+
+        ```py
+        >>> for name, param in model_peft.named_parameters():
+        ...     if ...:  # some check on name (ex. if 'lora' in name)
+        ...         param.requires_grad = False
+        ```
 
         Args:
             adapter_name (str): The name of the adapter to set as active
@@ -306,7 +350,13 @@ def _set_adapter(model, adapter_name):
         if isinstance(module, ModulesToSaveWrapper):
             # only check the adapter_name if we actually encounter a ModulesToSaveWrapper, otherwise we don't care
             adapter_name = check_adapter_name(adapter_name)
-            module.set_adapter(adapter_name)
+
+            # if the adapter is found in this module, set it as the active adapter, else disable the adapters of this
+            # module
+            if adapter_name in module.modules_to_save:
+                module.set_adapter(adapter_name)
+            else:
+                module.enable_adapters(False)
 
 
 def _prepare_prompt_learning_config(peft_config, model_config):
@@ -356,6 +406,11 @@ def fsdp_auto_wrap_policy(model):
     import os
 
     from accelerate import FullyShardedDataParallelPlugin
+
+    if hasattr(FullyShardedDataParallelPlugin, "get_module_class_from_name"):
+        get_module_class_from_name = FullyShardedDataParallelPlugin.get_module_class_from_name
+    else:
+        from accelerate.utils.dataclasses import get_module_class_from_name
     from torch.distributed.fsdp.wrap import _or_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy
 
     from ..tuners import PrefixEncoder, PromptEmbedding, PromptEncoder
@@ -368,7 +423,7 @@ def fsdp_auto_wrap_policy(model):
     ).split(",")
     transformer_cls_to_wrap = {PrefixEncoder, PromptEncoder, PromptEmbedding}
     for layer_class in transformer_cls_names_to_wrap:
-        transformer_cls = FullyShardedDataParallelPlugin.get_module_class_from_name(model, layer_class)
+        transformer_cls = get_module_class_from_name(model, layer_class)
         if transformer_cls is None:
             raise Exception("Could not find the transformer layer class to wrap in the model.")
         else:
@@ -518,3 +573,44 @@ def cast_mixed_precision_params(model, dtype):
             p.data = p.to(dtype)
         else:
             p.data = p.to(torch.float32)
+
+
+def str_to_bool(value: str) -> int:
+    """
+    Converts a string representation of truth to `True` (1) or `False` (0).
+
+    True values are `y`, `yes`, `t`, `true`, `on`, and `1`; False value are `n`, `no`, `f`, `false`, `off`, and `0`;
+    """
+    # same as function as in accelerate.utils, which replaces the deprecated distutils.util.strtobool
+    value = value.lower()
+    if value in ("y", "yes", "t", "true", "on", "1"):
+        return 1
+    elif value in ("n", "no", "f", "false", "off", "0"):
+        return 0
+    else:
+        raise ValueError(f"invalid truth value {value}")
+
+
+def check_file_exists_on_hf_hub(repo_id: str, filename: str, **kwargs) -> Optional[bool]:
+    """Check if a file exists on HF Hub, if check was not successful returns None instead of erroring.
+
+    Respect offline mode if set.
+
+    """
+    exists: Optional[bool] = None
+    if str_to_bool(os.environ.get("HF_HUB_OFFLINE", "0")):
+        # user set offline mode, cannot check
+        return exists
+
+    try:
+        exists = file_exists(repo_id, filename, **kwargs)
+    except (HFValidationError, EntryNotFoundError):
+        # error, exists stays None
+        pass
+    except Exception as e:
+        warnings.warn(
+            f"Unable to fetch remote file due to the following error {e} - silently ignoring the lookup"
+            f" for the file {filename} in {repo_id}."
+        )
+
+    return exists

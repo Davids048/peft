@@ -21,6 +21,7 @@ Quantization represents data with fewer bits, making it a useful technique for r
 * optimizing which model weights are quantized with the [AWQ](https://hf.co/papers/2306.00978) algorithm
 * independently quantizing each row of a weight matrix with the [GPTQ](https://hf.co/papers/2210.17323) algorithm
 * quantizing to 8-bit and 4-bit precision with the [bitsandbytes](https://github.com/TimDettmers/bitsandbytes) library
+* quantizing to as low as 2-bit precision with the [AQLM](https://arxiv.org/abs/2401.06118) algorithm
 
 However, after a model is quantized it isn't typically further trained for downstream tasks because training can be unstable due to the lower precision of the weights and activations. But since PEFT methods only add *extra* trainable parameters, this allows you to train a quantized model with a PEFT adapter on top! Combining quantization with PEFT can be a good strategy for training even the largest models on a single GPU. For example, [QLoRA](https://hf.co/papers/2305.14314) is a method that quantizes a model to 4-bits and then trains it with LoRA. This method allows you to finetune a 65B parameter model on a single 48GB GPU!
 
@@ -55,7 +56,7 @@ from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1", quantization_config=config)
 ```
 
-Next, you should call the [`~peft.utils.prepare_model_for_kbit_training`] function to preprocess the quantized model for traininng.
+Next, you should call the [`~peft.utils.prepare_model_for_kbit_training`] function to preprocess the quantized model for training.
 
 ```py
 from peft import prepare_model_for_kbit_training
@@ -76,7 +77,7 @@ config = LoraConfig(
     r=16,
     lora_alpha=8,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.05
+    lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
 )
@@ -94,36 +95,101 @@ You're all set for training with whichever training method you prefer!
 
 ### LoftQ initialization
 
-[LoftQ](https://hf.co/papers/2310.08659) initializes LoRA weights such that the quantization error is minimized, and it can improve performance when training quantized models. To get started, create a [`LoftQConfig`] and set `loftq_bits=4` for 4-bit quantization.
+[LoftQ](https://hf.co/papers/2310.08659) initializes LoRA weights such that the quantization error is minimized, and it can improve performance when training quantized models. To get started, follow [these instructions](https://github.com/huggingface/peft/tree/main/examples/loftq_finetuning).
 
-<Tip warning={true}>
+In general, for LoftQ to work best, it is recommended to target as many layers with LoRA as possible, since those not targeted cannot have LoftQ applied. This means that passing `LoraConfig(..., target_modules="all-linear")` will most likely give the best results. Also, you should use `nf4` as quant type in your quantization config when using 4bit quantization, i.e. `BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")`.
 
-LoftQ initialization does not require quantizing the base model with the `load_in_4bits` parameter in the [`~transformers.AutoModelForCausalLM.from_pretrained`] method! Learn more about LoftQ initialization in the [Initialization options](../developer_guides/lora#initialization) section.
+### QLoRA-style training
 
-</Tip>
+QLoRA adds trainable weights to all the linear layers in the transformer architecture. Since the attribute names for these linear layers can vary across architectures, set `target_modules` to `"all-linear"` to add LoRA to all the linear layers:
 
 ```py
-from peft import AutoModelForCausalLM, LoftQConfig, LoraConfig, get_peft_model
-
-model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1")
-loftq_config = LoftQConfig(loftq_bits=4)
+config = LoraConfig(target_modules="all-linear", ...)
 ```
 
-Now pass the `loftq_config` to the [`LoraConfig`] to enable LoftQ initialization, and create a [`PeftModel`] for training.
+## AQLM quantization
+
+Additive Quantization of Language Models ([AQLM](https://arxiv.org/abs/2401.06118)) is a Large Language Models compression method. It quantizes multiple weights together and takes advantage of interdependencies between them. AQLM represents groups of 8-16 weights as a sum of multiple vector codes. This allows it to compress models down to as low as 2-bit with considerably low accuracy losses.
+
+Since the AQLM quantization process is computationally expensive, a use of prequantized models is recommended. A partial list of available models can be found in the official aqlm [repository](https://github.com/Vahe1994/AQLM).
+
+The models support LoRA adapter tuning. To tune the quantized model you'll need to install the `aqlm` inference library: `pip install aqlm>=1.0.2`. Finetuned LoRA adapters shall be saved separately, as merging them with AQLM quantized weights is not possible.
 
 ```py
-lora_config = LoraConfig(
-    init_lora_weights="loftq",
-    loftq_config=loftq_config,
+quantized_model = AutoModelForCausalLM.from_pretrained(
+    "BlackSamorez/Mixtral-8x7b-AQLM-2Bit-1x16-hf-test-dispatch",
+    torch_dtype="auto", device_map="auto", low_cpu_mem_usage=True,
+)
+
+peft_config = LoraConfig(...)
+
+quantized_model = get_peft_model(quantized_model, peft_config)
+```
+
+You can refer to the [Google Colab](https://colab.research.google.com/drive/12GTp1FCj5_0SnnNQH18h_2XFh9vS_guX?usp=sharing) example for an overview of AQLM+LoRA finetuning.
+
+## EETQ quantization
+
+You can also perform LoRA fine-tuning on EETQ quantized models. [EETQ](https://github.com/NetEase-FuXi/EETQ) package offers simple and efficient way to perform 8-bit quantization, which is claimed to be faster than the `LLM.int8()` algorithm. First, make sure that you have a transformers version that is compatible with EETQ (e.g. by installing it from latest pypi or from source).
+
+```py
+import torch
+from transformers import EetqConfig
+
+config = EetqConfig("int8")
+```
+
+Pass the `config` to the [`~transformers.AutoModelForCausalLM.from_pretrained`] method.
+
+```py
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-v0.1", quantization_config=config)
+```
+
+and create a `LoraConfig` and pass it to `get_peft_model`:
+
+```py
+from peft import LoraConfig, get_peft_model
+
+config = LoraConfig(
     r=16,
     lora_alpha=8,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.05
+    lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
 )
 
-model = get_peft_model(model, lora_config)
+model = get_peft_model(model, config)
+```
+
+## HQQ quantization
+
+The models that is quantized using Half-Quadratic Quantization of Large Machine Learning Models ([HQQ](https://mobiusml.github.io/hqq_blog/)) support LoRA adapter tuning. To tune the quantized model, you'll need to install the `hqq` library with: `pip install hqq`.
+
+```py
+from hqq.engine.hf import HQQModelForCausalLM
+
+quantized_model = HQQModelForCausalLM.from_quantized(save_dir_or_hfhub, device='cuda')
+
+peft_config = LoraConfig(...)
+
+quantized_model = get_peft_model(quantized_model, peft_config)
+```
+
+Or using transformers version that is compatible with HQQ (e.g. by installing it from latest pypi or from source).
+
+```python
+from transformers import HqqConfig, AutoModelForCausalLM
+
+quant_config = HqqConfig(nbits=4, group_size=64)
+
+quantized_model = AutoModelForCausalLM.from_pretrained(save_dir_or_hfhub, device='cuda', quantization_config=quant_config)
+
+peft_config = LoraConfig(...)
+
+quantized_model = get_peft_model(quantized_model, peft_config)
 ```
 
 ## Next steps

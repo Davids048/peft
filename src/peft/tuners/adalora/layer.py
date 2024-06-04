@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,11 +15,20 @@
 import warnings
 from typing import Any, List, Optional
 
+import packaging
 import torch
+import transformers
 from torch import nn
 
 from peft.tuners.lora import LoraLayer
+from peft.tuners.tuners_utils import check_adapters_to_merge
 from peft.utils import transpose
+
+
+if packaging.version.parse(transformers.__version__) >= packaging.version.parse("4.33.0"):
+    from transformers.integrations import deepspeed_config
+else:
+    from transformers.deepspeed import deepspeed_config
 
 
 class AdaLoraLayer(LoraLayer):
@@ -37,8 +45,9 @@ class AdaLoraLayer(LoraLayer):
         self.ranknum = nn.ParameterDict({})
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
-        if r <= 0:
-            raise ValueError(f"`r` should be a positive integer value but the value passed is {r}")
+        if r < 0:
+            # note: r == 0 is allowed for AdaLora, see #1539
+            raise ValueError(f"`r` should be a positive integer or 0, but the value passed is {r}")
 
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
@@ -112,14 +121,10 @@ class SVDLinear(nn.Module, AdaLoraLayer):
                 The list of adapter names that should be merged. If None, all active adapters will be merged. Defaults
                 to `None`.
         """
-        if self.merged:
-            warnings.warn(
-                f"Already following adapters were merged {','.join(self.merged_adapters)}. "
-                f"You are now additionally merging {','.join(self.active_adapters)}."
-            )
-
-        if adapter_names is None:
-            adapter_names = self.active_adapters
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
 
         for active_adapter in adapter_names:
             base_layer = self.get_base_layer()
@@ -160,7 +165,6 @@ class SVDLinear(nn.Module, AdaLoraLayer):
         )
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
-        # TODO: SVDLinear does not convert dtype, unlike lora linear, is that correct?
         if self.disable_adapters:
             if self.merged:
                 self.unmerge()
@@ -179,6 +183,7 @@ class SVDLinear(nn.Module, AdaLoraLayer):
                 scaling = self.scaling[active_adapter]
                 ranknum = self.ranknum[active_adapter] + 1e-5
 
+                x = x.to(lora_A.dtype)
                 result += (dropout(x) @ (lora_A * lora_E).T @ lora_B.T) * scaling / ranknum
 
         return result
@@ -256,7 +261,13 @@ class RankAllocator:
                     self.exp_avg_ipt[n] = torch.zeros_like(p)
                     self.exp_avg_unc[n] = torch.zeros_like(p)
                 with torch.no_grad():
-                    self.ipt[n] = (p * p.grad).abs().detach()
+                    if deepspeed_config() is not None:
+                        import deepspeed
+
+                        grad = deepspeed.utils.safe_get_full_grad(p)
+                        self.ipt[n] = (p * grad).abs().detach()
+                    else:
+                        self.ipt[n] = (p * p.grad).abs().detach()
                     # Sensitivity smoothing
                     self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
                     # Uncertainty quantification

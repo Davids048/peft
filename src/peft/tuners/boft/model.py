@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,39 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import operator
-import re
+# The implementation is based on "Parameter-Efficient Orthogonal Finetuning
+# via Butterfly Factorization" (https://arxiv.org/abs/2311.06243) in ICLR 2024.
+
 import warnings
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from enum import Enum
-from functools import reduce
-from itertools import chain
 from typing import List, Optional
 
 import torch
 from torch import nn
 from tqdm import tqdm
-from transformers.pytorch_utils import Conv1D
 
-from peft.import_utils import is_bnb_4bit_available, is_bnb_available
 from peft.tuners.tuners_utils import BaseTuner, BaseTunerLayer, check_target_module_exists
 from peft.utils import (
     TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING,
     ModulesToSaveWrapper,
-    _freeze_adapter,
     _get_submodules,
-    get_auto_gptq_quant_linear,
-    get_quantization_config,
 )
 
 from .config import BOFTConfig
-from .layer import Linear, Conv2d, BOFTLayer
+from .layer import BOFTLayer, Conv2d, Linear
 
 
 class BOFTModel(BaseTuner):
     """
-    Creates BOFT and OFT model from a pretrained transformers model. Paper:
-    https://arxiv.org/abs/2311.06243
+    Creates BOFT and OFT model from a pretrained transformers model. Paper: https://arxiv.org/abs/2311.06243
     https://arxiv.org/abs/2306.07280
 
     Args:
@@ -58,26 +50,15 @@ class BOFTModel(BaseTuner):
 
     Example::
 
-        ```py
-        >>> import transformers
-        >>> from transformers import AutoModelForSeq2SeqLM, BOFTConfig
-        >>> from peft import BOFTConfig, get_peft_model
+        >>> import transformers >>> from transformers import AutoModelForSeq2SeqLM, BOFTConfig >>> from peft import
+        BOFTConfig, get_peft_model
 
-        >>> config = BOFTConfig(
-        ...     boft_block_size=8,
-        ...     boft_n_butterfly_factor=1,
-        ...     target_modules=["query", "value", "key", "output.dense", "mlp.fc1", "mlp.fc2"],
-        ...     boft_dropout=0.1,
-        ...     bias="boft_only",
-        ...     modules_to_save=["classifier"],
-        ... )
+        >>> config = BOFTConfig( ... boft_block_size=8, ... boft_n_butterfly_factor=1, ... target_modules=["query",
+        "value", "key", "output.dense", "mlp.fc1", "mlp.fc2"], ... boft_dropout=0.1, ... bias="boft_only", ...
+        modules_to_save=["classifier"], ... )
 
-        >>> model = transformers.Dinov2ForImageClassification.from_pretrained(
-        ...     "facebook/dinov2-large",
-        ...     num_labels=100,
-        ... )
-        >>> boft_model = get_peft_model(model, config)
-        ```
+        >>> model = transformers.Dinov2ForImageClassification.from_pretrained( ... "facebook/dinov2-large", ...
+        num_labels=100, ... ) >>> boft_model = get_peft_model(model, config)
 
     **Attributes**:
         - **model** ([`transformers.PreTrainedModel`]) -- The model to be adapted.
@@ -128,25 +109,25 @@ class BOFTModel(BaseTuner):
             "boft_n_butterfly_factor": boft_config.boft_n_butterfly_factor,
             "boft_dropout": boft_config.boft_dropout,
             "fan_in_fan_out": boft_config.fan_in_fan_out,
-            "init_boft_weights": boft_config.init_boft_weights,
+            "init_weights": boft_config.init_weights,
         }
         kwargs["bias"] = bias
 
         # If it is not a BOFTLayer, create a new module, else update it with new adapters
         if not isinstance(target, BOFTLayer):
             new_module = self._create_new_module(boft_config, adapter_name, target, **kwargs)
-            if adapter_name != self.active_adapter:
+            if adapter_name not in self.active_adapters:
                 # adding an additional adapter: it is not automatically trainable
                 new_module.requires_grad_(False)
             self._replace_module(parent, target_name, new_module, target)
         else:
             target.update_layer(
                 adapter_name,
-                boft_config.boft_block_size,
-                boft_config.boft_block_num,
-                boft_config.boft_n_butterfly_factor,
-                boft_config.boft_dropout,
-                boft_config.init_boft_weights,
+                boft_block_size=boft_config.boft_block_size,
+                boft_block_num=boft_config.boft_block_num,
+                boft_n_butterfly_factor=boft_config.boft_n_butterfly_factor,
+                boft_dropout=boft_config.boft_dropout,
+                init_weights=boft_config.init_weights,
             )
 
     def _replace_module(self, parent, child_name, new_module, child):
@@ -215,7 +196,8 @@ class BOFTModel(BaseTuner):
             new_module = Conv2d(target, adapter_name, **kwargs)
         else:
             raise ValueError(
-                f"Target module {target} is not supported. " f"Currently, only `torch.nn.Linear` and `torch.nn.Conv2d` is supported."
+                f"Target module {target} is not supported. "
+                "Currently, only `torch.nn.Linear` and `torch.nn.Conv2d` are supported."
             )
 
         return new_module
@@ -262,6 +244,7 @@ class BOFTModel(BaseTuner):
                     warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                     module.unmerge()
                 module.set_adapter(adapter_name)
+        self.active_adapter = adapter_name
 
     @staticmethod
     def _prepare_adapter_config(peft_config, model_config):
@@ -349,3 +332,100 @@ class BOFTModel(BaseTuner):
         model.
         """
         return self._unload_and_optionally_merge(merge=False)
+
+    def batch_adapters(self, adapter_lst, **kwargs):
+        """
+        batch the boft_R part of each adapter layer of the input adapters
+        """
+        import pickle
+        print("BOFT: batch_adapters")
+        try:
+            with open("./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl", "rb") as inp:
+                result_modules = pickle.load(inp)
+            print("using loaded batched adapter") 
+            
+            updated_count = 0
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    state = result_modules[updated_count]
+                    boft_R, boft_s, op_lst = state
+                    print("results", boft_R.shape, boft_s.shape, len(op_lst))
+                    module.boft_R["batched_adapter"] = boft_R.to(device=module.base_layer.weight.device)
+                    module.boft_s["batched_adapter"] = boft_s.to(device=module.base_layer.weight.device)
+                    if isinstance(module, Linear):
+                        module.batch_op["batched_adapter"] = module.move_batch_op(op_lst, device=module.base_layer.weight.device)
+                    module.set_adapter("batched_adapter")
+                    updated_count += 1
+
+        except Exception as e:
+            print("not using loaded batched adapters", e)
+            import multiprocessing
+            multiprocessing.set_start_method("spawn", force=True)
+            from concurrent.futures import ThreadPoolExecutor 
+            # Prepare data for multiprocessing
+            # We pass the module and adapter_lst as a tuple to the worker function
+            modules_to_process = []
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    modules_to_process.append((module, adapter_lst))
+            # Create a pool of processes and map the processing function to the data
+            with multiprocessing.Pool(processes=3) as pool:
+                result_modules = pool.map(self.process_module, modules_to_process)
+                print("result modules: ", len(result_modules))
+            
+            updated_count = 0
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    state = result_modules[updated_count]
+                    boft_R, boft_s, op_lst = state
+                    print("results", boft_R.shape, boft_s.shape, len(op_lst))
+                    module.boft_R["batched_adapter"] = boft_R
+                    module.boft_s["batched_adapter"] = boft_s
+                    module.batch_op["batched_adapter"] = op_lst
+                    module.set_adapter("batched_adapter")
+                    updated_count += 1
+            self.save_batched_adapters(result_modules, "./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl")
+
+
+    def process_module(self, module_info):
+            module, adapter_lst = module_info
+            if module.merged:
+                warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                module.unmerge()
+            return module.batch_adapters(adapter_lst)
+    
+    def save_batched_adapters(self, obj, filename):
+        import pickle
+        with open(filename, "wb+") as outp:
+            pickle.dump(obj, outp, pickle.HIGHEST_PROTOCOL)
+
+    def unbatch_adapters(self, adapter_lst):
+        """
+        Put the adapters in adapter_lst back to cuda
+        """
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                module.unbatch_adapters(adapter_lst)
+    
+    def move_all_boft_r_s_to_cpu(self, exclude_adapters=[]):
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                if module.merged:
+                    warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
+                    module.unmerge()
+                for adapter in module._all_available_adapter_names():
+                    if adapter not in exclude_adapters:
+                        module.move_boft_R_to_cpu(adapter)
+                        module.move_boft_s_to_cpu(adapter)
+                        module.move_boft_p_to_cpu()
+                torch.cuda.synchronize(module.base_layer.weight.device)
+    
+    def set_forward_mode(self, mode):
+        if mode not in ["capture", "warm_up", "use_graph", "regular"]:
+            raise Exception("mode is not defined", mode)
+        for module in self.model.modules():
+            if isinstance(module, BOFTLayer):
+                module.set_forward_mode(mode)

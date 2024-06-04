@@ -23,11 +23,11 @@ To achieve efficient fine-tuning, OFT represents the weight updates with an orth
 Orthogonal Butterfly (BOFT) generalizes OFT with Butterfly factorization and further improves its parameter efficiency and finetuning flexibility. In short, OFT can be viewed as a special case of BOFT. Different from LoRA that uses additive low-rank weight updates, BOFT uses multiplicative orthogonal weight updates. The comparison is shown below.
 
 <div class="flex justify-center">
-    <img src="https://github.com/wy1iu/butterfly-oft/blob/main/assets/BOFT_comparison.png"/>
+    <img src="https://raw.githubusercontent.com/wy1iu/butterfly-oft/main/assets/BOFT_comparison.png"/>
 </div>
 
 
-Serving a different alterative to LoRA, BOFT carries many advantages: 
+BOFT has some advantages compared to LoRA: 
 
 * BOFT proposes a simple yet generic way to finetune pretrained models to downstream tasks, yielding a better preservation of pretraining knowledge and a better parameter efficiency.
 * Through the orthogonality, BOFT introduces a structural constraint, i.e., keeping the [hyperspherical energy](https://arxiv.org/abs/1805.09298) unchanged during finetuning. This can effectively reduce the forgetting of pretraining knowledge.
@@ -41,7 +41,7 @@ In principle, BOFT can be applied to any subset of weight matrices in a neural n
 Similar to LoRA, the weights learned by OFT/BOFT can be integrated into the pretrained weight matrices using the merge_and_unload() function. This function merges the adapter weights with the base model which allows you to effectively use the newly merged model as a standalone model.
 
 <div class="flex justify-center">
-    <img src="https://github.com/wy1iu/butterfly-oft/blob/main/assets/boft_merge.png"/>
+    <img src="https://raw.githubusercontent.com/wy1iu/butterfly-oft/main/assets/boft_merge.png"/>
 </div>
 
 This works because during training, the orthogonal weight matrix (R in the diagram above) and the pretrained weight matrices are separate. But once training is complete, these weights can actually be merged (multiplied) into a new weight matrix that is equivalent.
@@ -62,10 +62,12 @@ As with other methods supported by PEFT, to fine-tune a model using OFT or BOFT,
 
 `BOFTConfig` allows you to control how OFT/BOFT is applied to the base model through the following parameters:
 
-- `boft_block_size`: the BOFT matrix block size across different layers, expressed in ``int``. Smaller block size results in sparser update matrices with fewer trainable paramters. **Note**, please choose it to be dividable to most layer ``in_features`` dimension, e.g., 4, 8, 16. Also, you can only specify either `boft_block_size` or `boft_block_num`, but not both simultaneously, because `boft_block_size` x `boft_block_num` = layer dimension.
-- `boft_block_num`: the number of BOFT matrix blocks across different layers, expressed in ``int``. Fewer blocks result in sparser update matrices with fewer trainable paramters. **Note**, please choose it to be dividable to most layer ``in_features`` dimension, e.g., 4, 8, 16. Also, you can only specify either `boft_block_size` or `boft_block_num`, but not both simultaneously, because `boft_block_size` x `boft_block_num` = layer dimension.
+- `boft_block_size`: the BOFT matrix block size across different layers, expressed in `int`. Smaller block size results in sparser update matrices with fewer trainable paramters. **Note**, please choose `boft_block_size` to be divisible by most layer's input dimension (`in_features`), e.g., 4, 8, 16. Also, please only 
+specify either `boft_block_size` or `boft_block_num`, but not both simultaneously or leaving both to 0, because `boft_block_size` x `boft_block_num` must equal the layer's input dimension.
+- `boft_block_num`: the number of BOFT matrix blocks across different layers, expressed in `int`. Fewer blocks result in sparser update matrices with fewer trainable paramters. **Note**, please choose `boft_block_num` to be divisible by most layer's input dimension (`in_features`), e.g., 4, 8, 16. Also, please only 
+specify either `boft_block_size` or `boft_block_num`, but not both simultaneously or leaving both to 0, because `boft_block_size` x `boft_block_num` must equal the layer's input dimension.
 - `boft_n_butterfly_factor`: the number of butterfly factors. **Note**, for `boft_n_butterfly_factor=1`, BOFT is the same as vanilla OFT, for `boft_n_butterfly_factor=2`, the effective block size of OFT becomes twice as big and the number of blocks become half.
-- `bias`: specify if the ``bias`` paramteres should be traind. Can be ``none``, ``all`` or ``boft_only``.
+- `bias`: specify if the `bias` parameters should be trained. Can be `"none"`, `"all"` or `"boft_only"`.
 - `boft_dropout`: specify the probability of multiplicative dropout.
 - `target_modules`: The modules (for example, attention blocks) to inject the OFT/BOFT matrices.
 - `modules_to_save`: List of modules apart from OFT/BOFT matrices to be set as trainable and saved in the final checkpoint. These typically include model's custom head that is randomly initialized for the fine-tuning task.

@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023-present the HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +19,7 @@ from typing import Any, List, Optional, Set, Tuple
 import torch
 import torch.nn as nn
 
-from peft.tuners.lycoris_utils import LycorisLayer
+from peft.tuners.lycoris_utils import LycorisLayer, check_adapters_to_merge
 
 
 class OFTLayer(nn.Module, LycorisLayer):
@@ -75,7 +74,7 @@ class OFTLayer(nn.Module, LycorisLayer):
             r (`int`): Rank for the added adapter.
             module_dropout (`float`): The dropout probability for disabling adapter during training.
             init_weights (`bool`): Whether to initialize weights.
-            coft (`bool`): Whether to use the constrainted variant of OFT or not.
+            coft (`bool`): Whether to use the constrained variant of OFT or not.
             eps (`float`):
                 The control strength of COFT. The freedom of rotation. Only has an effect if `coft` is set to True.
             block_share (`bool`): Whether to share the OFT parameters between blocks or not.
@@ -138,13 +137,10 @@ class OFTLayer(nn.Module, LycorisLayer):
                 The list of adapter names that should be merged. If `None`, all active adapters will be merged.
                 Defaults to `None`.
         """
-        if self.merged:
-            warnings.warn(
-                f"Already following adapters were merged {','.join(self.merged_adapters)}. "
-                f"You are now additionally merging {','.join(self.active_adapters)}."
-            )
-        if adapter_names is None:
-            adapter_names = self.active_adapters
+        adapter_names = check_adapters_to_merge(self, adapter_names)
+        if not adapter_names:
+            # no adapter to merge
+            return
 
         for active_adapter in adapter_names:
             if active_adapter in self._available_adapters:
@@ -250,7 +246,7 @@ class OFTLayer(nn.Module, LycorisLayer):
         b, r, c = data.shape
         # Ensure the input matrix is skew-symmetric
         skew = 0.5 * (data - data.transpose(1, 2))
-        I = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)
+        I = torch.eye(r, device=data.device).unsqueeze(0).expand(b, r, c)  # noqa: E741
 
         # Perform the Cayley parametrization
         Q = torch.bmm(I - skew, torch.inverse(I + skew))
@@ -274,7 +270,7 @@ class OFTLayer(nn.Module, LycorisLayer):
     def _project_batch(self, oft_r, eps=1e-5):
         # scaling factor for each of the smaller block matrix
         eps = eps * 1 / torch.sqrt(torch.tensor(oft_r.shape[0]))
-        I = (
+        I = (  # noqa: E741
             torch.zeros((oft_r.size(1), oft_r.size(1)), device=oft_r.device, dtype=oft_r.dtype)
             .unsqueeze(0)
             .expand_as(oft_r)
@@ -316,7 +312,6 @@ class OFTLayer(nn.Module, LycorisLayer):
                 if (not self.training) or (self.training and torch.rand(1) > module_dropout):
                     # differentiate between batched adapters and single adapters.
                     if active_adapter == "batched_adapter":
-                        print("forward: activation through batched adapters")
                         result = self.get_batched_activation(active_adapter, result)
                     else:
                         result = self._get_delta_activations(active_adapter, result, *args, **kwargs)
@@ -343,17 +338,13 @@ class OFTLayer(nn.Module, LycorisLayer):
             The result after multiplying the weights from the batched adapter
         """
         if active_adapter != "batched_adapter":
-            raise Error("active adapter is not batched_adapter, should not use get_batched_activation")
+            raise Exception("active adapter is not batched_adapter, should not use get_batched_activation")
         
         op = self.batch_op[active_adapter]
         batched_oft_r = self.oft_r[active_adapter]
-
         # process input to fit triton format (assuming 3D input tensor, triton requires 4D)
         input = input.unsqueeze(0)
-        print("get_batched_activation: after triton shape tranform, input shape:", input.shape)
-        print("get_batched_activation: batched_oft_r shape:", batched_oft_r.shape)
         result = op(input, batched_oft_r)
-        print("get_batched_activation: result:", result.shape)
         # return the first element (assuming 3D input tensor)
         return result[0]
 
@@ -377,11 +368,10 @@ class OFTLayer(nn.Module, LycorisLayer):
             If they don't have the same layout (rank * r * r), this won't work,
             as we can't stack the adapters together. 
         """
-        print("oft: batching adapters")
-        print("oft: layer_names:", self.adapter_layer_names)
+        # print("oft: batching adapters")
+        # print("oft: layer_names:", self.adapter_layer_names)
 
         for layer_name in self.adapter_layer_names:
-            print("processing layer:", layer_name)
             batched_adapters_lst = []
             batched_adapters_rank_lst = []
             module_dict = getattr(self, layer_name)
@@ -397,16 +387,12 @@ class OFTLayer(nn.Module, LycorisLayer):
                     # add the layer to adapter list
                     batched_adapters_lst.append(orth_rotate_layer)
                     batched_adapters_rank_lst.append(self.r[adapter])
-                    print("added layer type: ",type(orth_rotate_layer),"shape", layer.shape, "key: ", adapter, "rank:", self.r[adapter])
                     
                     # clear memory on cuda
-                    print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
                     layer_cpu = layer.to('cpu')
                     module_dict[adapter] = layer_cpu
                     del layer
                     torch.cuda.empty_cache()  # Clear CUDA cache if necessary
-                    # print("original layer: ", type(layer), "device:", layer.device)
-                    print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
                     
             # each adapter shape is n_useful_blocks * m (n_rows) * n (n_cols)
             # we stack on the 0'th dimention
@@ -416,17 +402,13 @@ class OFTLayer(nn.Module, LycorisLayer):
 
             # This process the 3D weight to 4D to fit triton 
             stacked_adapters = stacked_adapters.unsqueeze(0)
-            print("batch adapters: stacked adapters shape: ", stacked_adapters.shape) 
-            self.oft_r["batched_adapter"] = stacked_adapters
-            print("batch_adapters: oft_r shape", self.oft_r["batched_adapter"].shape)
+            self.oft_r["batched_adapter"] = stacked_adapters.to(self.base_layer.weight.dtype)
 
             # Add OFT layout (simply diagonal):
             # Original _block_diagonal transform the block layout to be on the diagonal
             # created by rank. So the layout is a rank x rank identity matrix
             layout_lst = [torch.eye(r,dtype=torch.bool) for r in batched_adapters_rank_lst]
             layout = torch.stack(layout_lst)
-            print("batch_adapters: layoutshape: ", layout.shape)
-            print("batch_adapters: laytout: layout")
             # Compile a Triton OP
             import triton
             import triton.ops

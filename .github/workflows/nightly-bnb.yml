@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-          docker-image-name: ["huggingface/peft-gpu-bnb-source:latest", "huggingface/peft-gpu-bnb-latest:latest"]
+          docker-image-name: ["huggingface/peft-gpu-bnb-source:latest", "huggingface/peft-gpu-bnb-latest:latest", "huggingface/peft-gpu-bnb-multi-source:latest"]
     runs-on: [self-hosted, single-gpu, nvidia-gpu, t4, ci]
     env:
       CUDA_VISIBLE_DEVICES: "0"
@@ -36,6 +36,7 @@ jobs:
           source activate peft
           pip install -e . --no-deps
           pip install pytest-reportlog pytest-cov parameterized datasets scipy einops
+          pip install "pytest>=7.2.0,<8.0.0" # see: https://github.com/huggingface/transformers/blob/ce4fff0be7f6464d713f7ac3e0bbaafbc6959ae5/setup.py#L148C6-L148C26
           mkdir transformers-clone && git clone https://github.com/huggingface/transformers.git transformers-clone # rename to transformers clone to avoid modules conflict
           if [ "${{ matrix.docker-image-name }}" == "huggingface/peft-gpu-bnb-latest:latest" ]; then
             cd transformers-clone
@@ -67,13 +68,13 @@ jobs:
         if: always()
         run: |
           pip install slack_sdk tabulate
-          python scripts/log_reports.py --slack_channel_name bnb-daily-ci >> $GITHUB_STEP_SUMMARY
+          python scripts/log_reports.py --slack_channel_name bnb-daily-ci-collab >> $GITHUB_STEP_SUMMARY
 
   run_all_tests_multi_gpu:
     strategy:
       fail-fast: false
       matrix:
-        docker-image-name: ["huggingface/peft-gpu-bnb-source:latest", "huggingface/peft-gpu-bnb-latest:latest"]
+        docker-image-name: ["huggingface/peft-gpu-bnb-source:latest", "huggingface/peft-gpu-bnb-latest:latest", "huggingface/peft-gpu-bnb-multi-source:latest"]
     runs-on: [self-hosted, multi-gpu, nvidia-gpu, t4, ci]
     env:
       CUDA_VISIBLE_DEVICES: "0,1"
@@ -91,6 +92,7 @@ jobs:
           source activate peft
           pip install -e . --no-deps
           pip install pytest-reportlog pytest-cov parameterized datasets scipy einops
+          pip install "pytest>=7.2.0,<8.0.0" # see: https://github.com/huggingface/transformers/blob/ce4fff0be7f6464d713f7ac3e0bbaafbc6959ae5/setup.py#L148C6-L148C26
           mkdir transformers-clone && git clone https://github.com/huggingface/transformers.git transformers-clone
           if [ "${{ matrix.docker-image-name }}" == "huggingface/peft-gpu-bnb-latest:latest" ]; then
             cd transformers-clone
@@ -128,4 +130,4 @@ jobs:
         if: always()
         run: |
           pip install slack_sdk tabulate
-          python scripts/log_reports.py --slack_channel_name bnb-daily-ci >> $GITHUB_STEP_SUMMARY
+          python scripts/log_reports.py --slack_channel_name bnb-daily-ci-collab >> $GITHUB_STEP_SUMMARY
