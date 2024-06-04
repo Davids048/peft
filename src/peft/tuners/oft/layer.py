@@ -312,7 +312,6 @@ class OFTLayer(nn.Module, LycorisLayer):
                 if (not self.training) or (self.training and torch.rand(1) > module_dropout):
                     # differentiate between batched adapters and single adapters.
                     if active_adapter == "batched_adapter":
-                        print("forward: activation through batched adapters")
                         result = self.get_batched_activation(active_adapter, result)
                     else:
                         result = self._get_delta_activations(active_adapter, result, *args, **kwargs)
@@ -339,17 +338,13 @@ class OFTLayer(nn.Module, LycorisLayer):
             The result after multiplying the weights from the batched adapter
         """
         if active_adapter != "batched_adapter":
-            raise Error("active adapter is not batched_adapter, should not use get_batched_activation")
+            raise Exception("active adapter is not batched_adapter, should not use get_batched_activation")
         
         op = self.batch_op[active_adapter]
         batched_oft_r = self.oft_r[active_adapter]
-
         # process input to fit triton format (assuming 3D input tensor, triton requires 4D)
         input = input.unsqueeze(0)
-        print("get_batched_activation: after triton shape tranform, input shape:", input.shape)
-        print("get_batched_activation: batched_oft_r shape:", batched_oft_r.shape)
         result = op(input, batched_oft_r)
-        print("get_batched_activation: result:", result.shape)
         # return the first element (assuming 3D input tensor)
         return result[0]
 
@@ -373,11 +368,10 @@ class OFTLayer(nn.Module, LycorisLayer):
             If they don't have the same layout (rank * r * r), this won't work,
             as we can't stack the adapters together. 
         """
-        print("oft: batching adapters")
-        print("oft: layer_names:", self.adapter_layer_names)
+        # print("oft: batching adapters")
+        # print("oft: layer_names:", self.adapter_layer_names)
 
         for layer_name in self.adapter_layer_names:
-            print("processing layer:", layer_name)
             batched_adapters_lst = []
             batched_adapters_rank_lst = []
             module_dict = getattr(self, layer_name)
@@ -393,16 +387,12 @@ class OFTLayer(nn.Module, LycorisLayer):
                     # add the layer to adapter list
                     batched_adapters_lst.append(orth_rotate_layer)
                     batched_adapters_rank_lst.append(self.r[adapter])
-                    print("added layer type: ",type(orth_rotate_layer),"shape", layer.shape, "key: ", adapter, "rank:", self.r[adapter])
                     
                     # clear memory on cuda
-                    print(f"before clear mem: allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
                     layer_cpu = layer.to('cpu')
                     module_dict[adapter] = layer_cpu
                     del layer
                     torch.cuda.empty_cache()  # Clear CUDA cache if necessary
-                    # print("original layer: ", type(layer), "device:", layer.device)
-                    print(f"after clear mem:  allocated: {torch.cuda.memory_allocated()}, reserved: {torch.cuda.memory_reserved()}")
                     
             # each adapter shape is n_useful_blocks * m (n_rows) * n (n_cols)
             # we stack on the 0'th dimention
@@ -412,17 +402,13 @@ class OFTLayer(nn.Module, LycorisLayer):
 
             # This process the 3D weight to 4D to fit triton 
             stacked_adapters = stacked_adapters.unsqueeze(0)
-            print("batch adapters: stacked adapters shape: ", stacked_adapters.shape) 
-            self.oft_r["batched_adapter"] = stacked_adapters
-            print("batch_adapters: oft_r shape", self.oft_r["batched_adapter"].shape)
+            self.oft_r["batched_adapter"] = stacked_adapters.to(self.base_layer.weight.dtype)
 
             # Add OFT layout (simply diagonal):
             # Original _block_diagonal transform the block layout to be on the diagonal
             # created by rank. So the layout is a rank x rank identity matrix
             layout_lst = [torch.eye(r,dtype=torch.bool) for r in batched_adapters_rank_lst]
             layout = torch.stack(layout_lst)
-            print("batch_adapters: layoutshape: ", layout.shape)
-            print("batch_adapters: laytout: layout")
             # Compile a Triton OP
             import triton
             import triton.ops
