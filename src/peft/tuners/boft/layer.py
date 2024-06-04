@@ -858,8 +858,20 @@ class Linear(nn.Module, BOFTLayer):
                     batched_boft_s = []
                     block_size = 0
 
-                    for adapter in adapter_lst:
-                        sparse_boft_R, boft_s, layout = self.get_sparse_weights_and_layout(adapter)
+                    all_configs = set()
+                    for i in range(len(adapter_lst)):
+                        adapter = adapter_lst[i]
+                        all_configs.add((self.n_butterfly_factors[adapter], self.boft_block_num[adapter], self.boft_block_size[adapter]))
+                        try:
+                            # Use previously sparsified weights if it exist
+                            prev_idx = adapter_lst[:i].index(adapter)
+                            sparse_boft_R = sparse_boft_R_lst[prev_idx]
+                            boft_s = batched_boft_s[prev_idx]
+                            layout = batched_adapters_layout_lst[prev_idx]
+                            print("using previous weights")
+                        except Exception as e:
+                            print("need to calculate sparse boft-R", e)
+                            sparse_boft_R, boft_s, layout = self.get_sparse_weights_and_layout(adapter)
                         sparse_boft_R_lst.append(sparse_boft_R)
                         batched_boft_s.append(boft_s)
                         batched_adapters_layout_lst.append(layout)
@@ -1112,7 +1124,7 @@ class Linear(nn.Module, BOFTLayer):
         """
         if self.forward_mode == "capture":
             # capture a cuda graph
-            print("in capture mode")
+            # print("in capture mode")
             # set up graph
             graph = torch.cuda.CUDAGraph()
             graph.enable_debug_mode()
@@ -1128,18 +1140,18 @@ class Linear(nn.Module, BOFTLayer):
 
                 result = self.base_layer(result, *args, **kwargs)
                 result = result.to(x.dtype)
+                self.static_weight.copy_(self.boft_s["batched_adapter"])
                 return result
                     
         elif self.forward_mode == "use_graph":
             if self.static_weight is None:
                 raise Exception("Static weight is not initialized. Was graph captured?")
-            self.static_weight.copy_(self.boft_s["batched_adapter"])
             self.graph.replay()
-            torch.cuda.current_stream(device=x.device).synchronize()
             # print("using cuda graph")
             result = x * self.static_weight
             result = self.base_layer(result, *args, **kwargs)
             result = result.to(x.dtype)
+            self.static_weight.copy_(self.boft_s["batched_adapter"], non_blocking=True)
             return result
         elif self.forward_mode in ["regular", "warm_up"]:
             # print("in regular inference mode")

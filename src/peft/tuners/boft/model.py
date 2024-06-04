@@ -333,36 +333,59 @@ class BOFTModel(BaseTuner):
         """
         return self._unload_and_optionally_merge(merge=False)
 
-    def batch_adapters(self, adapter_lst):
+    def batch_adapters(self, adapter_lst, **kwargs):
         """
         batch the boft_R part of each adapter layer of the input adapters
         """
+        import pickle
         print("BOFT: batch_adapters")
-        import multiprocessing
-        multiprocessing.set_start_method("spawn", force=True)
-        from concurrent.futures import ThreadPoolExecutor 
-        # Prepare data for multiprocessing
-        # We pass the module and adapter_lst as a tuple to the worker function
-        modules_to_process = []
-        for module in self.model.modules():
-            if isinstance(module, BOFTLayer):
-                modules_to_process.append((module, adapter_lst))
-        # Create a pool of processes and map the processing function to the data
-        with multiprocessing.Pool(processes=2) as pool:
-            result_modules = pool.map(self.process_module, modules_to_process)
-            print("result modules: ", len(result_modules))
+        try:
+            with open("./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl", "rb") as inp:
+                result_modules = pickle.load(inp)
+            print("using loaded batched adapter") 
+            
+            updated_count = 0
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    state = result_modules[updated_count]
+                    boft_R, boft_s, op_lst = state
+                    print("results", boft_R.shape, boft_s.shape, len(op_lst))
+                    module.boft_R["batched_adapter"] = boft_R.to(device=module.base_layer.weight.device)
+                    module.boft_s["batched_adapter"] = boft_s.to(device=module.base_layer.weight.device)
+                    if isinstance(module, Linear):
+                        module.batch_op["batched_adapter"] = module.move_batch_op(op_lst, device=module.base_layer.weight.device)
+                    module.set_adapter("batched_adapter")
+                    updated_count += 1
 
-        updated_count = 0
-        for module in self.model.modules():
-            if isinstance(module, BOFTLayer):
-                state = result_modules[updated_count]
-                boft_R, boft_s, op_lst = state
-                print("results", boft_R.shape, boft_s.shape, len(op_lst))
-                module.boft_R["batched_adapter"] = boft_R
-                module.boft_s["batched_adapter"] = boft_s
-                module.batch_op["batched_adapter"] = op_lst
-                module.set_adapter("batched_adapter")
-                updated_count += 1
+        except Exception as e:
+            print("not using loaded batched adapters", e)
+            import multiprocessing
+            multiprocessing.set_start_method("spawn", force=True)
+            from concurrent.futures import ThreadPoolExecutor 
+            # Prepare data for multiprocessing
+            # We pass the module and adapter_lst as a tuple to the worker function
+            modules_to_process = []
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    modules_to_process.append((module, adapter_lst))
+            # Create a pool of processes and map the processing function to the data
+            with multiprocessing.Pool(processes=3) as pool:
+                result_modules = pool.map(self.process_module, modules_to_process)
+                print("result modules: ", len(result_modules))
+            
+            updated_count = 0
+            for module in self.model.modules():
+                if isinstance(module, BOFTLayer):
+                    state = result_modules[updated_count]
+                    boft_R, boft_s, op_lst = state
+                    print("results", boft_R.shape, boft_s.shape, len(op_lst))
+                    module.boft_R["batched_adapter"] = boft_R
+                    module.boft_s["batched_adapter"] = boft_s
+                    module.batch_op["batched_adapter"] = op_lst
+                    module.set_adapter("batched_adapter")
+                    updated_count += 1
+            self.save_batched_adapters(result_modules, "./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl")
+
 
     def process_module(self, module_info):
             module, adapter_lst = module_info
@@ -370,6 +393,11 @@ class BOFTModel(BaseTuner):
                 warnings.warn("Adapter cannot be set when the model is merged. Unmerging the model first.")
                 module.unmerge()
             return module.batch_adapters(adapter_lst)
+    
+    def save_batched_adapters(self, obj, filename):
+        import pickle
+        with open(filename, "wb+") as outp:
+            pickle.dump(obj, outp, pickle.HIGHEST_PROTOCOL)
 
     def unbatch_adapters(self, adapter_lst):
         """
