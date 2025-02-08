@@ -385,9 +385,9 @@ class BOFTLayer(BaseTunerLayer):
             if adapter in self.boft_R_cpu.keys():
                 self.boft_R[adapter] = self.boft_R_cpu[adapter]
             else:
-                boft_R_cpu = boft_R_gpu.to('cpu', non_blocking=True)
+                boft_R_cpu = boft_R_gpu.to('cpu')
                 self.boft_R[adapter] = boft_R_cpu 
-                self.boft_R_cpu[adapter] = boft_R_cpu
+                # self.boft_R_cpu[adapter] = boft_R_cpu
             del boft_R_gpu
             torch.cuda.empty_cache()
             # print("boft_R moved to cpu:", self.boft_R[adapter].device)
@@ -413,7 +413,7 @@ class BOFTLayer(BaseTunerLayer):
     def move_boft_s_to_cpu(self, adapter):
         if self.boft_s[adapter].is_cuda:
             boft_s_gpu = self.boft_s[adapter]
-            self.boft_s[adapter] = boft_s_gpu.to('cpu', non_blocking=True)
+            self.boft_s[adapter] = boft_s_gpu.to('cpu')
             # torch.cuda.synchronize()
             del boft_s_gpu
             torch.cuda.empty_cache()
@@ -451,7 +451,7 @@ class BOFTLayer(BaseTunerLayer):
                 if boft_P.is_cuda:
                     boft_P_gpu = boft_P 
                     # print(f"boft_P: {boft_P_gpu.device}")
-                    boft_P_cpu = boft_P_gpu.to('cpu', non_blocking=True)
+                    boft_P_cpu = boft_P_gpu.to('cpu')
                     # torch.cuda.synchronize()
                     self.boft_P_dict[key] = boft_P_cpu
                     del boft_P_gpu
@@ -976,65 +976,6 @@ class Linear(nn.Module, BOFTLayer):
         return (sparse_boft_R, boft_s, layout)
 
 
-    
-    def create_dummy_batched_adapters(self, adapter_lst):
-        """
-        Create a batched adapter w/ len(adapter_lst) number of adapters. Each is 
-        a clone of the 1st adapter that is initially loaded to the model
-        """
-        print("BOFT creating dummy batched adapter")
-        print(adapter_lst)
-        with torch.cuda.device(self.base_layer.weight.device):
-            assert self.boft_R # There must be at least 1 adapter in the model
-
-            for adapter in self.active_adapters:
-                full_boft_R = self.get_full_boft_R(adapter=adapter) # n_factors, full_side, full_side
-                layout = self.get_boft_R_layout(adapter=adapter)
-                self.move_boft_s_to_gpu(adapter)
-                boft_s = self.boft_s[adapter]
-                n_factors, n_blocks, block_size ,_ = self.boft_R[adapter].shape
-                sub_block_size = int(block_size//2)
-
-                # sparsify this weight
-                each_step_factors_shape = [1, 1, full_boft_R.shape[1], full_boft_R.shape[2]]
-                factors_by_step_lst = []
-                for i in range(n_factors):
-                    cur_step_factors = self.sparsify_tensor(full_boft_R[i].view(each_step_factors_shape), # 1, 1, full_side, full_side
-                                            mask=layout[i],
-                                            block=int(block_size//2))
-                    factors_by_step_lst.append(cur_step_factors)
-                sparse_boft_R = torch.cat(factors_by_step_lst, dim=0) # n_factors, 1 adapter, m, n
-                break
-            unload_cuda_module()
-
-            # stack adapters together
-            sparse_boft_R_lst = [sparse_boft_R for _ in range(len(adapter_lst))]
-            sparse_batched_boft_R = torch.cat(sparse_boft_R_lst, dim=1).to(device=self.base_layer.weight.device) # n_factors, n_adapters, m, n
-            print(f"stacked_full adapters: {sparse_batched_boft_R.shape}") # factor * batch * m * n 
-            self.boft_R["batched_adapter"] = sparse_batched_boft_R.to(device=self.base_layer.weight.device)
-
-          
-            # stack boft_s
-            batched_boft_s = [boft_s for _ in range(len(adapter_lst))]
-            self.boft_s["batched_adapter"] = torch.stack(batched_boft_s, dim=0).permute(0,2,1).to(device=self.base_layer.weight.device)
-
-            # compile ops
-            ops_lst = []
-            for i in range(n_factors):
-                # only use the first layout (triton only needs 1 unified layout)
-                batch_op = triton.ops.blocksparse.matmul(layout[i], sub_block_size, "dds", device=self.base_layer.weight.device)
-                ops_lst.append(batch_op)
-            self.batch_op["batched_adapter"] = ops_lst
-
-            self.set_adapter("batched_adapter")
-        self.move_boft_p_to_cpu()
-        return (self.boft_R["batched_adapter"], self.boft_s["batched_adapter"], self.batch_op["batched_adapter"])
-            
-
-
-
-
-
     def unbatch_adapters(self, adapter_lst):
         """
         Put the adapters in self.batched_adapters back to cuda
@@ -1127,8 +1068,8 @@ class Linear(nn.Module, BOFTLayer):
             # print("in capture mode")
             # set up graph
             graph = torch.cuda.CUDAGraph()
-            graph.enable_debug_mode()
-            graph.debug_dump("./graph_debug.dot")
+            # graph.enable_debug_mode()
+            # graph.debug_dump("./graph_debug.dot")
             self.graph = graph
             self.static_weight = torch.rand_like(self.boft_s["batched_adapter"], device=x.device)
             # record the part using triton
@@ -1166,6 +1107,9 @@ class Linear(nn.Module, BOFTLayer):
                 return result
 
     def batched_triton_activation(self, static_weight):
+        """
+        boft_s * B1 * B2 * ... * Bn
+        """
         # static_weight is boft_s at first.
         # prepare
         boft_R = self.boft_R["batched_adapter"]

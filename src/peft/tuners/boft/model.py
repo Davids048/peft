@@ -33,6 +33,7 @@ from peft.utils import (
 
 from .config import BOFTConfig
 from .layer import BOFTLayer, Conv2d, Linear
+import os
 
 
 class BOFTModel(BaseTuner):
@@ -337,10 +338,16 @@ class BOFTModel(BaseTuner):
         """
         batch the boft_R part of each adapter layer of the input adapters
         """
+        if "save_directory" in kwargs.keys():
+                save_dir = kwargs['save_directory']
+                if not os.path.exists(save_dir):
+                    raise Exception("save_dir does not exist")
+
         import pickle
         print("BOFT: batch_adapters")
         try:
-            with open("./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl", "rb") as inp:
+            with open(os.path.join(save_dir, 
+                                   "batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl"), "rb") as inp:
                 result_modules = pickle.load(inp)
             print("using loaded batched adapter") 
             
@@ -384,7 +391,9 @@ class BOFTModel(BaseTuner):
                     module.batch_op["batched_adapter"] = op_lst
                     module.set_adapter("batched_adapter")
                     updated_count += 1
-            self.save_batched_adapters(result_modules, "./batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl")
+            self.save_batched_adapters(result_modules, 
+                                       os.path.join(save_dir, 
+                                                    "batched_adapters" + str(len(adapter_lst))+"_"+ adapter_lst[0] + ".pkl"))
 
 
     def process_module(self, module_info):

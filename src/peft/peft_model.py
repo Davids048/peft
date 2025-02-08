@@ -1033,7 +1033,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             self.base_model.set_adapter(adapter_name)
         _set_adapter(self, adapter_name)
 
-    def batch_adapters(self, adapter_lst: list, save_directory=None, **kwargs)->None:
+    def batch_adapters(self, adapter_lst: list, save_directory="", **kwargs)->None:
         print("model: batching adapter")
         # create a config for the new adapter
         # extract the 0th adapter's config as the batched_adapter's config
@@ -1044,7 +1044,7 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             torch.cuda.synchronize()
             print("finished move boft weights to cpu")
         # batch adapters
-        self.base_model.batch_adapters(adapter_lst, **kwargs)
+        self.base_model.batch_adapters(adapter_lst, save_directory=save_directory)
         print("model finished batching")
 
         # QUESTION: update config?
